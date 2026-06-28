@@ -64,9 +64,8 @@ MAX_USERNAME_LENGTH = 64
 PASSWORD_HASH_PREFIX = "pbkdf2_sha256"
 PASSWORD_HASH_ITERATIONS = 200_000
 DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_PASSWORD_HASH = (
-    "pbkdf2_sha256$200000$J/e5rRP71Gd8SNs4XEhKMw==$p3r2gxvcempHM1jbO7Tro8zrzXFE571/2jsn+VW95tU="
-)
+# No hardcoded default password: if admin creds aren't configured, the admin is
+# created on first run via the web setup page (/web/admin/login → 首次设置).
 MAILBOX_ACCESS_KEY_LENGTH = 12
 PUBLIC_QUERY_PAGE_SIZE = 20
 ADMIN_MAILBOX_PAGE_SIZE = 20
@@ -2424,6 +2423,13 @@ class MailBridgeStore:
             created_at=format_beijing_time(row["created_at"]),
         )
 
+    def has_any_admin(self) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM users WHERE role = 'admin' AND active = 1 LIMIT 1"
+            ).fetchone()
+        return row is not None
+
     def ensure_admin_user(self, username: str, password_hash: str) -> None:
         normalized_username = normalize_username(username)
         normalized_hash = str(password_hash or "").strip()
@@ -2921,15 +2927,18 @@ class MailBridgeApplication:
             )
 
     def bootstrap_admin_user(self) -> None:
-        username = self.admin_username or DEFAULT_ADMIN_USERNAME
-        password_hash = self.admin_password_hash or DEFAULT_ADMIN_PASSWORD_HASH
-        if not self.admin_username or not self.admin_password_hash:
-            self.logger.warning(
-                "auth.admin config missing, fallback to default admin credentials: username=%s password=admin",
-                username,
-            )
-        self.store.ensure_admin_user(username, password_hash)
-        self.logger.info("web admin bootstrap ensured for user=%s", username)
+        # Configured admin (config.json / env) is ensured as before. Otherwise we
+        # do NOT create any default admin — first run sets the password via the
+        # web setup page. ponytail: no fallback creds, no shipped secret.
+        if self.admin_username and self.admin_password_hash:
+            self.store.ensure_admin_user(self.admin_username, self.admin_password_hash)
+            self.logger.info("web admin bootstrap ensured for user=%s", self.admin_username)
+            return
+        if self.store.has_any_admin():
+            return
+        self.logger.warning(
+            "no admin configured and none exists yet — set one via /web/admin/login (首次设置)."
+        )
 
     def build_session_token_hash(self, token: str) -> str:
         material = f"{self.session_secret}:{str(token or '').strip()}".encode("utf-8")
@@ -3355,12 +3364,25 @@ function setStatus(text, kind = "") {
   node.classList.remove("ok", "error");
   if (kind) node.classList.add(kind);
 }
+let needsSetup = false;
 el("login-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const username = el("login-user").value.trim();
   const password = el("login-pass").value.trim();
   if (!username || !password) {
     setStatus("请输入管理员用户名和密码", "error");
+    return;
+  }
+  if (needsSetup) {
+    if (password.length < 8) { setStatus("管理员密码至少 8 位", "error"); return; }
+    setStatus("正在创建管理员...", "");
+    const res = await api("/web/auth/setup", { method: "POST", body: JSON.stringify({ username, password }) });
+    if (res.status === 200 && res.data.ok) {
+      setStatus("管理员已创建，正在进入后台...", "ok");
+      location.href = "/web/admin";
+      return;
+    }
+    setStatus(`创建失败: ${res.data.error || "操作失败"}`, "error");
     return;
   }
   setStatus("正在登录...", "");
@@ -3376,6 +3398,16 @@ el("login-form").onsubmit = async (ev) => {
   const me = await api("/web/me");
   if (me.status === 200 && me.data.ok && (((me.data.user || {}).role || "").toLowerCase() === "admin")) {
     location.href = "/web/admin";
+    return;
+  }
+  const st = await api("/web/auth/admin-status");
+  if (st.status === 200 && st.data.ok && st.data.needs_setup) {
+    needsSetup = true;
+    document.querySelector(".panel h2").textContent = "首次设置管理员";
+    document.querySelector(".panel p").textContent = "系统尚未设置管理员，请创建首个管理员账号（密码至少 8 位）。";
+    el("btn-login").textContent = "创建管理员";
+    el("login-pass").setAttribute("autocomplete", "new-password");
+    el("login-pass").setAttribute("placeholder", "请设置管理员密码（至少 8 位）");
   }
 })();
 </script>
@@ -5978,6 +6010,9 @@ el("cdk-next-page").onclick = () => {
         if parsed.path in {"/web/query", "/web/login"}:
             self._send_html(HTTPStatus.OK, self._render_login_page())
             return
+        if parsed.path == "/web/auth/admin-status":
+            self._send_json(HTTPStatus.OK, {"ok": True, "needs_setup": not self.app.store.has_any_admin()})
+            return
         if parsed.path == "/web/admin/login":
             self._send_html(HTTPStatus.OK, self._render_admin_login_page())
             return
@@ -6413,6 +6448,45 @@ el("cdk-next-page").onclick = () => {
                     },
                 },
             )
+            return
+        if parsed.path == "/web/auth/setup":
+            # First-run admin setup: only usable while NO admin exists. Once an
+            # admin is created this is permanently locked (409). No shipped creds.
+            if self.app.store.has_any_admin():
+                self._send_json(HTTPStatus.CONFLICT, {"ok": False, "error": "admin_already_exists"})
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            username = normalize_username(payload.get("username")) or DEFAULT_ADMIN_USERNAME
+            password = str(payload.get("password") or "")
+            if len(username) > MAX_USERNAME_LENGTH:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "username_too_long"})
+                return
+            if len(password) < 8:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "password_too_short"})
+                return
+            if len(password) > MAX_PASSWORD_LENGTH:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "password_too_long"})
+                return
+            self.app.store.ensure_admin_user(username, build_password_hash(password))
+            user = self.app.store.get_user_by_username(username)
+            if not user:
+                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "setup_failed"})
+                return
+            token, expires_at = self.app.create_user_session(int(user["id"]))
+            body = json.dumps(
+                {"ok": True, "user": {"username": str(user["username"]), "role": "admin"}, "dashboard": "/web/admin"},
+                ensure_ascii=False,
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self._set_session_cookie(token, expires_at)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if parsed.path == "/web/auth/login":
             # Throttle brute force: too many recent failures from one client are
@@ -7129,7 +7203,7 @@ def make_server(args: argparse.Namespace) -> ThreadingHTTPServer:
     api_token = resolve_shared_token(config_path, args.api_token)
     inbound_token = resolve_shared_token(config_path, args.inbound_token or api_token)
     admin_username = normalize_username(admin_conf.get("username") or DEFAULT_ADMIN_USERNAME)
-    admin_password_hash = str(admin_conf.get("password_hash") or DEFAULT_ADMIN_PASSWORD_HASH).strip()
+    admin_password_hash = str(admin_conf.get("password_hash") or "").strip()
     session_secret = str(auth_conf.get("session_secret") or "").strip()
     logger = setup_logger(Path(args.log_dir).resolve())
     store = MailBridgeStore(Path(args.db).resolve(), logger=logger)
