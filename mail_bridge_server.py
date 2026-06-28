@@ -1507,6 +1507,17 @@ class MailBridgeStore:
             return None
         return self._mailbox_record_from_row(row)
 
+    def get_mailbox_id_by_address(self, address: str) -> int:
+        normalized = normalize_address(address)
+        if not normalized:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id FROM mailbox_credentials WHERE address = ? LIMIT 1",
+                (normalized,),
+            ).fetchone()
+        return int(row["id"] or 0) if row else 0
+
     def verify_mailbox_access(self, address: str, access_key: str) -> tuple[bool, Optional[MailboxCredentialRecord], str]:
         normalized_address = normalize_address(address)
         raw_key = str(access_key or "").strip()
@@ -7107,6 +7118,73 @@ el("cdk-next-page").onclick = () => {
                     "created_at": format_beijing_time(utcnow_iso()),
                 },
             )
+            return
+        if parsed.path == "/api/mailboxes/import":
+            # 新增邮箱到预售池（presale）。Body: {content, note?, tag_ids?}
+            if not self._require_auth(self.app.api_token):
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            content = str(payload.get("content") or "")
+            note = str(payload.get("note") or "").strip()
+            raw_tag_ids = payload.get("tag_ids")
+            tag_ids = raw_tag_ids if isinstance(raw_tag_ids, list) else []
+            if not content.strip():
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_content"})
+                return
+            summary = self.app.store.bulk_create_mailbox_credentials(content, note=note, tag_ids=tag_ids)
+            self._send_json(HTTPStatus.OK, {"ok": True, "summary": summary})
+            return
+        if parsed.path == "/api/mailboxes/tags":
+            # 给邮箱打标签（整体覆盖）。Body: {address|mailbox_id, tag_ids:[...]}
+            if not self._require_auth(self.app.api_token):
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            raw_tag_ids = payload.get("tag_ids")
+            if not isinstance(raw_tag_ids, list):
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_tag_ids"})
+                return
+            mailbox_id = self._parse_int(payload.get("mailbox_id"), default=0, minimum=0, maximum=10_000_000)
+            if not mailbox_id:
+                mailbox_id = self.app.store.get_mailbox_id_by_address(payload.get("address"))
+            if not mailbox_id:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mailbox_not_found"})
+                return
+            success, mailbox, reason = self.app.store.set_mailbox_tags(mailbox_id, raw_tag_ids)
+            if not success or not mailbox:
+                status = HTTPStatus.NOT_FOUND if reason in {"mailbox_not_found", "tag_not_found"} else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "mailbox": mailbox})
+            return
+        if parsed.path == "/api/mailboxes/delete":
+            # 软删除邮箱（status=deleted, active=0）。Body: {address|mailbox_id}
+            if not self._require_auth(self.app.api_token):
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            mailbox_id = self._parse_int(payload.get("mailbox_id"), default=0, minimum=0, maximum=10_000_000)
+            if not mailbox_id:
+                mailbox_id = self.app.store.get_mailbox_id_by_address(payload.get("address"))
+            if not mailbox_id:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mailbox_not_found"})
+                return
+            success, reason = self.app.store.delete_mailbox_credential(mailbox_id)
+            if not success:
+                status = HTTPStatus.NOT_FOUND if reason == "mailbox_not_found" else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, "mailbox_id": mailbox_id})
             return
         if parsed.path == "/api/invites/mark":
             if not self._require_auth(self.app.api_token):

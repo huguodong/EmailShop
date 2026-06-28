@@ -530,6 +530,36 @@ POST /web/user/redeem
 
 ---
 
+## 8.5 库存管理开放接口（Bearer `api_token`）
+
+供外部系统直接管理邮箱库存，鉴权同其它 `/api/*`：`Authorization: Bearer <api_token>`。
+
+| 方法 | 接口 | Body | 说明 |
+|------|------|------|------|
+| POST | `/api/mailboxes/import` | `{content, note?, tag_ids?}` | 批量新增邮箱**到预售池**（`status=presale`）。`content` 每行一个地址；返回 `{ok, summary}`（含 `created/skipped/invalid` 及每行结果）。`tag_ids` 给新邮箱打标签。 |
+| POST | `/api/mailboxes/tags` | `{address｜mailbox_id, tag_ids:[...]}` | 给邮箱打标签，**整体覆盖**（传 `[]` 清空）。可用 `address` 或 `mailbox_id` 定位。标签需已存在，否则 `tag_not_found`。 |
+| POST | `/api/mailboxes/delete` | `{address｜mailbox_id}` | **软删除**邮箱（`status=deleted, active=0`，保留标签/归属/邮件）。 |
+
+错误：`missing_content`(400)、`invalid_tag_ids`(400)、`mailbox_not_found`(404)、`tag_not_found`(404)。
+
+```bash
+curl -X POST "http://127.0.0.1:8880/api/mailboxes/import" \
+  -H "Authorization: Bearer <api_token>" -H "Content-Type: application/json" \
+  -d '{"content":"a@x.com\nb@x.com","note":"批次A","tag_ids":[1]}'
+
+curl -X POST "http://127.0.0.1:8880/api/mailboxes/tags" \
+  -H "Authorization: Bearer <api_token>" -H "Content-Type: application/json" \
+  -d '{"address":"a@x.com","tag_ids":[1,2]}'
+
+curl -X POST "http://127.0.0.1:8880/api/mailboxes/delete" \
+  -H "Authorization: Bearer <api_token>" -H "Content-Type: application/json" \
+  -d '{"address":"a@x.com"}'
+```
+
+> 标签的创建/查询仍在后台（`POST/GET /web/admin/tags`，管理员 cookie），开放接口只负责给邮箱关联已有标签。
+
+---
+
 ## 9. 常见对接方案
 
 ### 方案 A：注册机 / OTP 轮询器获取验证码
