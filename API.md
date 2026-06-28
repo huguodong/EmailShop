@@ -538,6 +538,7 @@ POST /web/user/redeem
 |------|------|------|------|
 | POST | `/api/mailboxes/import` | `{content, note?, tag_ids?}` | 批量新增邮箱**到预售池**（`status=presale`）。`content` 每行一个地址；返回 `{ok, summary}`（含 `created/skipped/invalid` 及每行结果）。`tag_ids` 给新邮箱打标签。 |
 | POST | `/api/mailboxes/tags` | `{address｜mailbox_id, tag_ids:[...]}` | 给邮箱打标签，**整体覆盖**（传 `[]` 清空）。可用 `address` 或 `mailbox_id` 定位。标签需已存在，否则 `tag_not_found`。 |
+| POST | `/api/mailboxes/note` | `{address｜mailbox_id, note}` | 改邮箱**备注**，与标签互不影响。传空 `note` 即清空备注。 |
 | POST | `/api/mailboxes/delete` | `{address｜mailbox_id}` | **软删除**邮箱（`status=deleted, active=0`，保留标签/归属/邮件）。**幂等**：邮箱不存在也返回 `{ok:true, deleted:false}`。 |
 
 错误：`missing_content`(400)、`invalid_tag_ids`(400)、`mailbox_not_found`(404，仅 tags 接口)、`tag_not_found`(404)。

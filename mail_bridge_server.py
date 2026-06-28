@@ -7164,6 +7164,32 @@ el("cdk-next-page").onclick = () => {
                 return
             self._send_json(HTTPStatus.OK, {"ok": True, "mailbox": mailbox})
             return
+        if parsed.path == "/api/mailboxes/note":
+            # 改邮箱备注（与标签互不影响）。Body: {address|mailbox_id, note}
+            if not self._require_auth(self.app.api_token):
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            mailbox_id = self._parse_int(payload.get("mailbox_id"), default=0, minimum=0, maximum=10_000_000)
+            if not mailbox_id:
+                mailbox_id = self.app.store.get_mailbox_id_by_address(payload.get("address"))
+            if not mailbox_id:
+                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mailbox_not_found"})
+                return
+            note = str(payload.get("note") or "").strip()
+            success, mailbox, reason = self.app.store.update_mailbox_note(mailbox_id, note)
+            if not success or not mailbox:
+                status = HTTPStatus.NOT_FOUND if reason == "mailbox_not_found" else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {"ok": True, "mailbox": {"id": mailbox.mailbox_id, "address": mailbox.address, "note": mailbox.note}},
+            )
+            return
         if parsed.path == "/api/mailboxes/delete":
             # 软删除邮箱（status=deleted, active=0）。Body: {address|mailbox_id}
             if not self._require_auth(self.app.api_token):
