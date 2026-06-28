@@ -7176,15 +7176,15 @@ el("cdk-next-page").onclick = () => {
             mailbox_id = self._parse_int(payload.get("mailbox_id"), default=0, minimum=0, maximum=10_000_000)
             if not mailbox_id:
                 mailbox_id = self.app.store.get_mailbox_id_by_address(payload.get("address"))
+            # Idempotent: a missing mailbox is treated as already-gone success.
             if not mailbox_id:
-                self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mailbox_not_found"})
+                self._send_json(HTTPStatus.OK, {"ok": True, "mailbox_id": 0, "deleted": False})
                 return
             success, reason = self.app.store.delete_mailbox_credential(mailbox_id)
-            if not success:
-                status = HTTPStatus.NOT_FOUND if reason == "mailbox_not_found" else HTTPStatus.BAD_REQUEST
-                self._send_json(status, {"ok": False, "error": reason})
+            if not success and reason != "mailbox_not_found":
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": reason})
                 return
-            self._send_json(HTTPStatus.OK, {"ok": True, "mailbox_id": mailbox_id})
+            self._send_json(HTTPStatus.OK, {"ok": True, "mailbox_id": mailbox_id, "deleted": success})
             return
         if parsed.path == "/api/invites/mark":
             if not self._require_auth(self.app.api_token):
