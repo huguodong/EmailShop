@@ -51,7 +51,10 @@ DEFAULT_CONFIG_PATH = RUNTIME_ROOT / "config.json"
 DEFAULT_LOG_DIR = RUNTIME_ROOT / "logs"
 DEFAULT_DB_PATH = RUNTIME_ROOT / "mail_bridge.sqlite3"
 FORCED_NEW_ADDRESS_DOMAIN = "52moyu.net"
-ICLOUD_FORWARD_ALIAS_ADDRESS = "icloud@52moyu.net"
+ICLOUD_FORWARD_ALIAS_ADDRESSES = {
+    "icloud@52moyu.net",
+    "icloud2@52moyu.net",
+}
 SESSION_COOKIE_NAME = "mail_bridge_session"
 DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 LOGIN_MAX_FAILURES = 5
@@ -251,7 +254,7 @@ def get_header_value(headers: Any, *names: str) -> str:
 
 def resolve_effective_recipient_address(address: Any, headers: Any) -> str:
     normalized = normalize_address(address)
-    if normalized != ICLOUD_FORWARD_ALIAS_ADDRESS:
+    if normalized not in ICLOUD_FORWARD_ALIAS_ADDRESSES:
         return normalized
 
     for header_name in ("to",):
