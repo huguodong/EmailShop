@@ -4462,9 +4462,8 @@ boot();
     th,td { border-bottom:1px solid #edf1f5; padding:14px 12px; text-align:left; vertical-align:top; font-size:14px; }
     th { position:sticky; top:0; background:#f8fafc; color:#5d6d83; font-size:12px; text-transform:uppercase; letter-spacing:.08em; z-index:1; }
     td code { display:inline-block; padding:4px 8px; border-radius:10px; background:#f4f7fb; }
-    .email-preview, .note-preview, .key-preview-cell { display:inline-block; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; }
+    .email-preview, .note-preview { display:inline-block; max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; vertical-align:top; }
     .email-preview { max-width:240px; }
-    .key-preview-cell { max-width:170px; }
     .status-chip { display:inline-flex; align-items:center; gap:8px; min-height:28px; padding:0 10px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid transparent; }
     .status-chip::before { content:""; width:8px; height:8px; border-radius:999px; background:currentColor; opacity:.9; }
     .status-chip.active { color:#0d7a56; background:#ecfbf4; border-color:#cdeedd; }
@@ -4630,7 +4629,7 @@ boot();
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>邮箱</th><th>密钥</th><th>备注</th><th>状态</th><th>创建时间</th><th>邮件数</th><th>操作</th></tr>
+                <tr><th>ID</th><th>邮箱</th><th>备注</th><th>标签</th><th>状态</th><th>创建时间</th><th>邮件数</th><th>操作</th></tr>
               </thead>
               <tbody id="mailboxes-body"></tbody>
             </table>
@@ -5172,7 +5171,6 @@ function renderMailboxesTable() {
     const tr = document.createElement("tr");
     const addressText = String(m.address || "").trim();
     const noteText = String(m.note || "").trim();
-    const keyText = String(m.access_key || "").trim();
     const poolMap = { presale: ["预售池", "warn"], available: ["可兑换", "active"], sold: ["已售出", "inactive"], deleted: ["已删除", "inactive"] };
     const pool = poolMap[m.status] || ["可兑换", "active"];
     const statusLabel = m.active ? pool[0] : "停用";
@@ -5183,14 +5181,11 @@ function renderMailboxesTable() {
     const noteDisplay = noteText
       ? `<span class="note-preview" title="${escapeHtml(noteText)}">${escapeHtml(noteText)}</span>`
       : "-";
-    const keyDisplay = keyText
-      ? `<code class="key-preview-cell" title="${escapeHtml(keyText)}">${escapeHtml(keyText)}</code>`
-      : `<code>-</code>`;
     const tags = Array.isArray(m.tags) ? m.tags : [];
     const tagsDisplay = tags.length
-      ? tags.map((tag) => `<span class="tag-chip">${escapeHtml(tag.name || "")}</span>`).join("")
+      ? `<div class="tag-list">${tags.map((tag) => `<span class="tag-chip">${escapeHtml(tag.name || "")}</span>`).join("")}</div>`
       : "-";
-    tr.innerHTML = `<td>${m.id}</td><td>${addressDisplay}</td><td>${keyDisplay}</td><td>${noteDisplay}<div class="tag-list" style="margin-top:6px">${tagsDisplay}</div></td><td><span class="status-chip ${statusClass}" title="${statusLabel}">${statusLabel}</span></td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
+    tr.innerHTML = `<td>${m.id}</td><td>${addressDisplay}</td><td>${noteDisplay}</td><td>${tagsDisplay}</td><td><span class="status-chip ${statusClass}" title="${statusLabel}">${statusLabel}</span></td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
       <td>
         <div class="table-actions">
           <button data-a="copy" data-id="${m.id}" class="icon-btn ghost" title="复制凭据" aria-label="复制凭据">⧉</button>
