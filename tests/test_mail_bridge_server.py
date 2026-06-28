@@ -411,6 +411,27 @@ class MailBridgeServerTests(unittest.TestCase):
             log_text,
         )
 
+    def test_inbound_logging_records_request_metadata_for_dedup_tracing(self) -> None:
+        self._post_inbound_rfc822(
+            "Message-ID: <abc123@example.com>\n"
+            "To: Hide My Email <termini_rant.5o@icloud.com>\n"
+            "From: OpenAI <noreply@openai.com>\n"
+            "Subject: Your ChatGPT code is 112233\n"
+            "\n"
+            "Use 112233 to continue.",
+            envelope_to="icloud@52moyu.net",
+            from_address="noreply@openai.com",
+        )
+
+        log_text = self._read_log_text()
+
+        self.assertIn(
+            "inbound request: method=POST path=/inbound/email source_address=icloud@52moyu.net "
+            "effective_address=termini_rant.5o@icloud.com to=icloud@52moyu.net "
+            "from=noreply@openai.com message_id=<abc123@example.com>",
+            log_text,
+        )
+
     def test_web_login_returns_admin_dashboard_and_sets_session_cookie(self) -> None:
         status, body, cookie = self._web_login(ADMIN_USERNAME, ADMIN_PASSWORD)
         self.assertEqual(status, 200)
@@ -1235,6 +1256,48 @@ class MailBridgeServerTests(unittest.TestCase):
         self.assertEqual(by_address["csv-existing@example.com"]["note"], "CSV导入")
         self.assertEqual(by_address["csv-new@example.com"]["access_key"], "CSVNEW654321")
         self.assertEqual(by_address["csv-generated@example.com"]["note"], "CSV导入")
+
+    def test_admin_can_import_csv_with_tags(self) -> None:
+        status, _, admin_cookie = self._web_login(ADMIN_USERNAME, ADMIN_PASSWORD)
+        self.assertEqual(status, 200)
+
+        status, tag_body = self._request(
+            "POST",
+            "/web/admin/tags",
+            payload={"name": "CSV标签"},
+            include_auth=False,
+            cookie=admin_cookie,
+        )  # type: ignore[assignment]
+        self.assertEqual(status, 200)
+        tag_id = tag_body["tag"]["id"]
+
+        status, body = self._request(
+            "POST",
+            "/web/admin/mailboxes/import-csv",
+            payload={
+                "content": "csv-tagged@example.com----CSVTAG123456",
+                "note": "CSV标签导入",
+                "tag_ids": [tag_id],
+            },
+            include_auth=False,
+            cookie=admin_cookie,
+        )  # type: ignore[assignment]
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+
+        status, list_body = self._request(
+            "GET",
+            "/web/admin/mailboxes?keyword=csv-tagged@example.com",
+            include_auth=False,
+            cookie=admin_cookie,
+        )  # type: ignore[assignment]
+        self.assertEqual(status, 200)
+        self.assertEqual(list_body["total"], 1)
+        mailbox = list_body["mailboxes"][0]
+        self.assertEqual(mailbox["address"], "csv-tagged@example.com")
+        self.assertEqual(mailbox["status"], "presale")
+        self.assertTrue(any(tag["id"] == tag_id for tag in mailbox["tags"]))
+        self.assertEqual(mailbox["tags"][0]["name"], "CSV标签")
 
     def test_admin_mailbox_email_list_endpoint_returns_recent_messages(self) -> None:
         self._post_inbound_mail(

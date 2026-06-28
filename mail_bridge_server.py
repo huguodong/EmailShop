@@ -1299,7 +1299,7 @@ class MailBridgeStore:
             "results": results,
         }
 
-    def import_mailbox_credentials_csv(self, csv_text: str, *, note: str = "") -> dict[str, Any]:
+    def import_mailbox_credentials_csv(self, csv_text: str, *, note: str = "", tag_ids: Optional[list[Any]] = None) -> dict[str, Any]:
         raw_text = str(csv_text or "")
         clean_note = str(note or "").strip()
         if not raw_text.strip():
@@ -1404,6 +1404,8 @@ class MailBridgeStore:
                         )
                         continue
                     record = self._mailbox_record_from_row(row)
+                    if tag_ids:
+                        self.set_mailbox_tags(record.mailbox_id, tag_ids)
                     updated += 1
                     results.append(
                         {
@@ -1460,6 +1462,8 @@ class MailBridgeStore:
                     ).fetchone()
                 if row:
                     mailbox = self._mailbox_record_from_row(row)
+            if tag_ids:
+                self.set_mailbox_tags(mailbox.mailbox_id, tag_ids)
             created += 1
             results.append(
                 {
@@ -4719,6 +4723,10 @@ boot();
                   <span class="field-label">统一备注</span>
                   <input id="csv-import-note" placeholder="可选，不填则保留原备注">
                 </label>
+                <label class="field">
+                  <span class="field-label">统一标签</span>
+                  <select id="csv-import-tags" multiple size="4"></select>
+                </label>
                 <button id="btn-import-csv" class="button-block">导入 CSV</button>
               </div>
             </div>
@@ -5125,6 +5133,7 @@ function renderAdminTags() {
   if (!tagCache.length) {
     container.innerHTML = '<span class="muted">暂无标签</span>';
     renderTagOptions();
+    renderCsvImportTagOptions();
     return;
   }
   container.innerHTML = tagCache.map((tag) => `
@@ -5134,6 +5143,20 @@ function renderAdminTags() {
     </span>
   `).join("");
   renderTagOptions();
+  renderCsvImportTagOptions();
+}
+
+function renderCsvImportTagOptions() {
+  const select = el("csv-import-tags");
+  if (!select) return;
+  if (!tagCache.length) {
+    select.innerHTML = '<option value="" disabled>暂无标签</option>';
+    select.selectedIndex = -1;
+    return;
+  }
+  select.innerHTML = tagCache
+    .map((tag) => `<option value="${escapeHtml(String(tag.id || ""))}">${escapeHtml(String(tag.name || ""))}</option>`)
+    .join("");
 }
 
 async function refreshTags() {
@@ -5324,6 +5347,12 @@ el("btn-import-csv").onclick = async () => {
   button.disabled = true;
   const fileInput = el("csv-import-file");
   const note = el("csv-import-note").value.trim();
+  const tagSelect = el("csv-import-tags");
+  const tagIds = tagSelect
+    ? Array.from(tagSelect.selectedOptions)
+        .map((option) => Number(option.value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    : [];
   const file = fileInput && fileInput.files ? fileInput.files[0] : null;
   if (!file) {
     setStatus("请先选择 CSV 文件", "error");
@@ -5335,7 +5364,7 @@ el("btn-import-csv").onclick = async () => {
     const content = await file.text();
     const res = await api("/web/admin/mailboxes/import-csv", {
       method: "POST",
-      body: JSON.stringify({ content, note, filename: file.name }),
+      body: JSON.stringify({ content, note, filename: file.name, tag_ids: tagIds }),
     });
     setResult(res.data);
     if (!(res.status === 200 && res.data.ok)) {
@@ -5347,6 +5376,7 @@ el("btn-import-csv").onclick = async () => {
     setStatus(`CSV 导入完成：新增 ${summary.created || 0}，覆盖 ${summary.updated || 0}，非法 ${summary.invalid || 0}`, "ok");
     if (fileInput) fileInput.value = "";
     el("csv-import-note").value = "";
+    if (tagSelect) Array.from(tagSelect.options).forEach((option) => { option.selected = false; });
     await refreshMailboxes(true);
   } finally {
     button.disabled = false;
@@ -6886,7 +6916,9 @@ el("cdk-next-page").onclick = () => {
             if not content.strip():
                 self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_content"})
                 return
-            summary = self.app.store.import_mailbox_credentials_csv(content, note=note)
+            raw_tag_ids = payload.get("tag_ids")
+            tag_ids = raw_tag_ids if isinstance(raw_tag_ids, list) else []
+            summary = self.app.store.import_mailbox_credentials_csv(content, note=note, tag_ids=tag_ids)
             self._send_json(
                 HTTPStatus.OK,
                 {
@@ -7249,6 +7281,42 @@ el("cdk-next-page").onclick = () => {
         except Exception as exc:
             self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_inbound_payload:{exc}"})
             return
+        inbound_headers = payload.get("headers") if isinstance(payload.get("headers"), dict) else {}
+        source_address = normalize_address(payload.get("to") or payload.get("address"))
+        effective_address = resolve_effective_recipient_address(source_address, inbound_headers)
+        inbound_message_id = str(
+            self.headers.get("x-mail-message-id")
+            or self.headers.get("X-Mail-Message-Id")
+            or inbound_headers.get("Message-ID")
+            or inbound_headers.get("message-id")
+            or ""
+        ).strip()
+        inbound_to = str(
+            self.headers.get("x-mail-to")
+            or self.headers.get("X-Mail-To")
+            or inbound_headers.get("To")
+            or inbound_headers.get("to")
+            or ""
+        ).strip()
+        inbound_from = str(
+            self.headers.get("x-mail-from")
+            or self.headers.get("X-Mail-From")
+            or inbound_headers.get("From")
+            or inbound_headers.get("from")
+            or ""
+        ).strip()
+        inbound_received = str(inbound_headers.get("Received") or inbound_headers.get("received") or "").strip()
+        self.app.logger.info(
+            "inbound request: method=%s path=%s source_address=%s effective_address=%s to=%s from=%s message_id=%s received_hdr=%s",
+            self.command,
+            parsed.path,
+            source_address or "-",
+            effective_address or "-",
+            inbound_to or "-",
+            inbound_from or "-",
+            inbound_message_id or "-",
+            inbound_received.splitlines()[0] if inbound_received else "-",
+        )
         try:
             record = self.app.store.save_message(payload)
         except ValueError as exc:
