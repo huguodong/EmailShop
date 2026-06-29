@@ -3573,6 +3573,7 @@ el("login-form").onsubmit = async (ev) => {
             <input id="cdk-code" autocomplete="off" placeholder="请输入卡密，例如 CDK-ABCDE-FGHJK-LMNPQ-RSTUV">
             <button id="btn-redeem" class="button-primary" type="button">立即兑换</button>
           </div>
+          <div class="admin-entry" style="margin-top:12px">卡网地址：<a href="https://pay.ldxp.cn/shop/GIVMA9MV" target="_blank" rel="noopener noreferrer">https://pay.ldxp.cn/shop/GIVMA9MV</a></div>
           <div id="redeem-status" class="message-area"></div>
           <div id="redeem-result" class="email-list" style="margin-top:14px"></div>
           <div class="admin-entry">需要长期管理已购邮箱？ <a href="/web/user">登录 / 注册账号 →</a></div>
