@@ -278,6 +278,35 @@ class MailBridgeServerTests(unittest.TestCase):
         self.assertTrue(alias_body["ok"])
         self.assertIsNone(alias_body["email"])
 
+    def test_icloud_forwarded_mail_can_restore_original_recipient_from_received_header(self) -> None:
+        self._post_inbound_rfc822(
+            "\n".join(
+                [
+                    "Received: from mail-oo2-f1.google.com with SMTP id 46e09a7af769-7e9b7237ccfso658488a34.1 for <amnesia.tap-8c@icloud.com>; Sun, 28 Jun 2026 08:22:33 -0700 (PDT)",
+                    "From: relay@example.com",
+                    "To: icloud@52moyu.net",
+                    "Subject: Your ChatGPT code is 778899",
+                    "Content-Type: text/plain; charset=utf-8",
+                    "",
+                    "Use 778899 to continue.",
+                ]
+            ),
+            envelope_to="icloud@52moyu.net",
+            from_address="relay@example.com",
+        )
+
+        status, body = self._request("GET", "/api/latest?address=amnesia.tap-8c@icloud.com")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["email"]["to"], "amnesia.tap-8c@icloud.com")
+        self.assertEqual(body["email"]["verification_code"], "778899")
+
+        status, alias_body = self._request("GET", "/api/latest?address=icloud@52moyu.net")
+        self.assertEqual(status, 200)
+        self.assertTrue(alias_body["ok"])
+        self.assertIsNone(alias_body["email"])
+
     def test_invite_classification_and_link_extraction(self) -> None:
         self._post_inbound_mail(
             {

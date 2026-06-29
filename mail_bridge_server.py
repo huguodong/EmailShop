@@ -257,7 +257,7 @@ def resolve_effective_recipient_address(address: Any, headers: Any) -> str:
     if normalized not in ICLOUD_FORWARD_ALIAS_ADDRESSES:
         return normalized
 
-    for header_name in ("to",):
+    for header_name in ("to", "received"):
         candidates = [item for item in extract_email_addresses(get_header_value(headers, header_name)) if item]
         non_alias_candidates = [item for item in candidates if item != normalized]
         if len(non_alias_candidates) == 1:
