@@ -174,12 +174,15 @@ class MailBridgeServerTests(unittest.TestCase):
         token: str = API_TOKEN,
         cookie: str = "",
         include_auth: bool = True,
+        host: str | None = None,
     ) -> tuple[int, bytes, dict]:
         headers = {}
         if include_auth and token:
             headers["Authorization"] = f"Bearer {token}"
         if cookie:
             headers["Cookie"] = cookie
+        if host:
+            headers["Host"] = host
         request = Request(f"{self.base_url}{path}", headers=headers, method=method)
         with urlopen(request, timeout=5) as response:
             return response.status, response.read(), dict(response.headers.items())
@@ -2093,6 +2096,26 @@ class MailBridgeServerTests(unittest.TestCase):
             "startAutoRefresh",
         ):
             self.assertIn(marker, html)
+
+    def test_email_host_query_redirects_to_icloud_query(self) -> None:
+        status, _, headers = self._raw_request(
+            "GET",
+            "/web/query",
+            include_auth=False,
+            host="email.52moyu.net",
+        )
+        self.assertEqual(status, 302)
+        self.assertEqual(headers.get("Location"), "https://icloud.52moyu.net/web/query")
+
+    def test_icloud_host_query_still_serves_public_page(self) -> None:
+        status, raw, _ = self._raw_request(
+            "GET",
+            "/web/query",
+            include_auth=False,
+            host="icloud.52moyu.net",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn('data-tab-btn="redeem"', raw.decode("utf-8"))
 
 
 if __name__ == "__main__":
