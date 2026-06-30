@@ -1507,8 +1507,15 @@ class MailBridgeServerTests(unittest.TestCase):
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])
-        self.assertEqual(self._tag_stock(self._stock(cookie), tag_id)["available"], 2)
+        # Imported stock lands in the presale pool until a CDK reserves it.
+        before = self._tag_stock(self._stock(cookie), tag_id)
+        self.assertEqual(before["presale"], 2)
+        self.assertEqual(before["available"], 0)
         code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+        # Generating the CDK moves one mailbox from presale into the redeemable pool.
+        after_gen = self._tag_stock(self._stock(cookie), tag_id)
+        self.assertEqual(after_gen["presale"], 1)
+        self.assertEqual(after_gen["available"], 1)
 
         status, body = self._redeem(code)  # anonymous: no cookie
         self.assertEqual(status, 200, body)
@@ -1519,7 +1526,7 @@ class MailBridgeServerTests(unittest.TestCase):
         self.assertTrue(mailbox["access_key"])
 
         after = self._tag_stock(self._stock(cookie), tag_id)
-        self.assertEqual(after["available"], 1)
+        self.assertEqual(after["available"], 0)
         self.assertEqual(after["sold"], 1)
 
     def test_anonymous_redeem_double_spend_is_conflict(self) -> None:
@@ -1538,14 +1545,22 @@ class MailBridgeServerTests(unittest.TestCase):
     def test_insufficient_stock_preserves_inventory(self) -> None:
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
-        self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])  # 2 available
-        code = self._gen_cdk(cookie, tag_id=tag_id, quantity=5)[0]["code"]  # asks for 5
+        self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])  # 2 in presale
 
-        status, body = self._redeem(code)
-        self.assertEqual(status, 409)
-        self.assertEqual(body["error"], "insufficient_stock")
+        # Over-sell is now blocked up front: generating a CDK for more than the
+        # presale stock is rejected, and nothing is moved out of presale.
+        status, body = self._request(
+            "POST",
+            "/web/admin/cdks",
+            payload={"count": 1, "tag_id": tag_id, "quantity": 5},  # asks for 5
+            include_auth=False,
+            cookie=cookie,
+        )
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["error"], "insufficient_presale")
         unchanged = self._tag_stock(self._stock(cookie), tag_id)
-        self.assertEqual(unchanged["available"], 2)
+        self.assertEqual(unchanged["presale"], 2)
+        self.assertEqual(unchanged["available"], 0)
         self.assertEqual(unchanged["sold"], 0)
 
     def test_revoked_cdk_cannot_be_redeemed(self) -> None:
@@ -1614,19 +1629,22 @@ class MailBridgeServerTests(unittest.TestCase):
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("only@x.com", cookie, tag_ids=[tag_id])  # exactly 1 in stock
-        codes = [c["code"] for c in self._gen_cdk(cookie, tag_id=tag_id, quantity=1, count=2)]
+        # Over-issuing CDKs beyond stock is now impossible (gen reserves presale),
+        # so the live race is two concurrent redemptions of the *same* single-use
+        # code: exactly one wins, the other is rejected as already used.
+        code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
 
-        barrier = threading.Barrier(len(codes))
+        barrier = threading.Barrier(2)
         results: list = []
         lock = threading.Lock()
 
-        def worker(code: str) -> None:
+        def worker() -> None:
             barrier.wait()
             status, body = self._redeem(code)
             with lock:
                 results.append((status, body.get("error")))
 
-        threads = [threading.Thread(target=worker, args=(c,)) for c in codes]
+        threads = [threading.Thread(target=worker) for _ in range(2)]
         for t in threads:
             t.start()
         for t in threads:
@@ -1636,7 +1654,7 @@ class MailBridgeServerTests(unittest.TestCase):
         losses = [r for r in results if r[0] == 409]
         self.assertEqual(len(wins), 1, results)
         self.assertEqual(len(losses), 1, results)
-        self.assertEqual(losses[0][1], "insufficient_stock")
+        self.assertEqual(losses[0][1], "cdk_used")
         final = self._tag_stock(self._stock(cookie), tag_id)
         self.assertEqual(final["available"], 0)
         self.assertEqual(final["sold"], 1)
@@ -1808,6 +1826,8 @@ class MailBridgeServerTests(unittest.TestCase):
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("a@x.com\nb@x.com\nc@x.com", cookie, tag_ids=[tag_id])
+        # gen reserves 2 (presale->available); redeem sells those 2. The 3rd
+        # mailbox stays in presale (never reserved), so available ends at 0.
         code = self._gen_cdk(cookie, tag_id=tag_id, quantity=2)[0]["code"]
         self.assertEqual(self._redeem(code)[0], 200)  # sells 2 of 3
 
@@ -1816,7 +1836,7 @@ class MailBridgeServerTests(unittest.TestCase):
         stats = body["stats"]
         self.assertEqual(stats["total"], 3)
         self.assertEqual(stats["sold"], 2)
-        self.assertEqual(stats["available"], 1)
+        self.assertEqual(stats["available"], 0)
         self.assertEqual(stats["today_sold"], 2)
         self.assertEqual(stats["today_redemptions"], 1)
 
@@ -1879,10 +1899,12 @@ class MailBridgeServerTests(unittest.TestCase):
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("dead@x.com\nspare@x.com", cookie, tag_ids=[tag_id])
-        code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+        # Reserve both into the redeemable pool, then redeem only one. The other
+        # stays 'available' as the spare that replace will swap in.
+        codes = self._gen_cdk(cookie, tag_id=tag_id, quantity=1, count=2)
         self.assertEqual(self._web_register("buyer", USER_PASSWORD)[0], 200)
         _, _, user_cookie = self._web_login("buyer", USER_PASSWORD)
-        status, redeemed = self._redeem(code, cookie=user_cookie)
+        status, redeemed = self._redeem(codes[0]["code"], cookie=user_cookie)
         self.assertEqual(status, 200)
         bad_address = redeemed["mailboxes"][0]["address"]
         bad_credential = redeemed["mailboxes"][0]["credential"]
@@ -1940,6 +1962,9 @@ class MailBridgeServerTests(unittest.TestCase):
         cookie = self._admin_cookie()
         t1 = self._create_tag("outlook", cookie)
         t2 = self._create_tag("gmail", cookie)
+        # Each CDK reserves a presale mailbox, so stock it first.
+        self._bulk_import("o1@x.com\no2@x.com", cookie, tag_ids=[t1])
+        self._bulk_import("g1@x.com\ng2@x.com\ng3@x.com", cookie, tag_ids=[t2])
         self._gen_cdk(cookie, tag_id=t1, quantity=1, count=2)
         self._gen_cdk(cookie, tag_id=t2, quantity=1, count=3)
 
@@ -1953,6 +1978,8 @@ class MailBridgeServerTests(unittest.TestCase):
     def test_cdk_list_filters_by_keyword_batch(self) -> None:
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
+        # 3 presale: 2 for the march batch + 1 for the unlabelled CDK.
+        self._bulk_import("a@x.com\nb@x.com\nc@x.com", cookie, tag_ids=[tag_id])
         self._request(
             "POST",
             "/web/admin/cdks",

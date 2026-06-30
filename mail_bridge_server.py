@@ -11,6 +11,7 @@ from email.header import decode_header, make_header
 from email.parser import BytesParser
 from email.utils import getaddresses
 import hashlib
+from html import unescape as html_unescape
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie
 import json
@@ -329,14 +330,15 @@ def strip_html_tags(value: Any) -> str:
     text = str(value or "")
     if not text:
         return ""
-    return re.sub(r"<[^>]+>", " ", text)
+    # Drop non-content blocks first so their CSS/JS doesn't leak into previews.
+    text = re.sub(r"(?is)<(style|script|head|title)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return html_unescape(text)
 
 
-def build_mail_preview_text(subject: str, text: str, html: str, body: str, verification_code: str, invite_link: str) -> str:
-    if verification_code:
-        return f"验证码：{verification_code}"
-    if invite_link:
-        return f"邀请链接：{invite_link}"
+def build_mail_preview_text(subject: str, text: str, html: str, body: str, verification_code: str = "", invite_link: str = "") -> str:
+    # ponytail: generic content summary for any mail format; verification_code /
+    # invite_link are still surfaced as separate fields, not baked into the preview.
     candidates = [text, strip_html_tags(html), body, subject]
     for candidate in candidates:
         normalized = re.sub(r"\s+", " ", str(candidate or "").strip())
@@ -1176,13 +1178,13 @@ class MailBridgeStore:
         lines = str(raw_text or "").splitlines()
         clean_note = str(note or "").strip()
         seen_in_request: set[str] = set()
-        results: list[dict[str, Any]] = []
-        created = 0
-        reset = 0
-        skipped = 0
-        invalid = 0
+        results_by_line: dict[int, dict] = {}
         accepted_lines = 0
+        invalid_count = 0
+        skipped_count = 0
 
+        # Phase 1: validate (no DB access)
+        valid_items: list[tuple[int, str, str]] = []
         for line_no, raw_line in enumerate(lines, start=1):
             source = str(raw_line or "").strip()
             if not source:
@@ -1190,141 +1192,105 @@ class MailBridgeStore:
             accepted_lines += 1
             address = normalize_address(source)
             if not is_valid_email_address(address):
-                invalid += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "invalid",
-                        "reason": "invalid_address",
-                    }
-                )
+                invalid_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "invalid", "reason": "invalid_address"}
                 continue
             if address in seen_in_request:
-                skipped += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "skipped",
-                        "reason": "duplicate_in_request",
-                    }
-                )
+                skipped_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "skipped", "reason": "duplicate_in_request"}
                 continue
             seen_in_request.add(address)
-            ok, mailbox, reason = self.create_mailbox_credential(address, note=clean_note, tag_ids=tag_ids)
-            if ok and mailbox:
-                created += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": mailbox.address,
-                        "status": "created",
-                        "reason": "ok",
-                        "mailbox": {
-                            "id": mailbox.mailbox_id,
-                            "address": mailbox.address,
-                            "access_key": mailbox.access_key,
-                            "credential": f"{mailbox.address}----{mailbox.access_key}",
-                            "note": mailbox.note,
-                            "created_at": mailbox.created_at,
-                            "updated_at": mailbox.updated_at,
-                            "active": mailbox.active,
-                        },
-                    }
-                )
-                continue
-            if reason == "address_exists":
-                with self._lock:
-                    existing_row = self._conn.execute(
-                        "SELECT id FROM mailbox_credentials WHERE address = ? LIMIT 1",
-                        (address,),
-                    ).fetchone()
-                existing_id = int(existing_row["id"] or 0) if existing_row else 0
-                if existing_id:
-                    reset_ok, reset_mailbox, reset_reason = self.reset_mailbox_access_key(existing_id)
-                else:
-                    reset_ok, reset_mailbox, reset_reason = False, None, "mailbox_not_found"
-                if reset_ok and reset_mailbox:
-                    reset += 1
-                    results.append(
-                        {
-                            "line": line_no,
-                            "input": source,
-                            "address": reset_mailbox.address,
-                            "status": "reset",
-                            "reason": "ok",
-                            "mailbox": {
-                                "id": reset_mailbox.mailbox_id,
-                                "address": reset_mailbox.address,
-                                "access_key": reset_mailbox.access_key,
-                                "credential": f"{reset_mailbox.address}----{reset_mailbox.access_key}",
-                                "note": reset_mailbox.note,
-                                "created_at": reset_mailbox.created_at,
-                                "updated_at": reset_mailbox.updated_at,
-                                "active": reset_mailbox.active,
-                            },
-                        }
-                    )
-                    continue
-                invalid += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "invalid",
-                        "reason": reset_reason,
-                    }
-                )
-                continue
-            invalid += 1
-            results.append(
-                {
-                    "line": line_no,
-                    "input": source,
-                    "address": address,
-                    "status": "invalid",
-                    "reason": reason,
-                }
-            )
+            valid_items.append((line_no, source, address))
 
-        return {
-            "total_lines": len(lines),
-            "accepted_lines": accepted_lines,
-            "created": created,
-            "reset": reset,
-            "skipped": skipped,
-            "invalid": invalid,
-            "results": results,
-        }
+        if not valid_items:
+            results = [results_by_line[k] for k in sorted(results_by_line)]
+            return {"total_lines": len(lines), "accepted_lines": accepted_lines, "created": 0, "reset": 0, "skipped": skipped_count, "invalid": invalid_count, "results": results}
+
+        # Phase 2: single lock + single commit for the whole batch
+        now = utcnow_iso()
+        normalized_tag_ids = sorted({int(t) for t in (tag_ids or []) if int(t or 0) > 0})
+        all_addresses = [item[2] for item in valid_items]
+        ph = ",".join("?" * len(all_addresses))
+        result_map: dict[str, Any] = {}
+        existing_set: set[str] = set()
+
+        with self._lock:
+            existing_rows = self._conn.execute(
+                f"SELECT address FROM mailbox_credentials WHERE address IN ({ph})",
+                all_addresses,
+            ).fetchall()
+            existing_set = {row["address"] for row in existing_rows}
+
+            new_rows = [(addr, clean_note, now, now) for _, _, addr in valid_items if addr not in existing_set]
+            # ponytail: generate_access_key per existing address — same behaviour as reset_mailbox_access_key
+            reset_rows = [(generate_access_key(), now, addr) for _, _, addr in valid_items if addr in existing_set]
+
+            if new_rows:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO mailbox_credentials (address, access_key, active, status, note, created_at, updated_at) VALUES (?, '', 1, 'presale', ?, ?, ?)",
+                    new_rows,
+                )
+            if reset_rows:
+                self._conn.executemany(
+                    "UPDATE mailbox_credentials SET access_key = ?, active = 1, updated_at = ? WHERE address = ?",
+                    reset_rows,
+                )
+            self._conn.commit()
+
+            fetched = self._conn.execute(
+                f"SELECT id, address, access_key, active, note, created_at, updated_at FROM mailbox_credentials WHERE address IN ({ph})",
+                all_addresses,
+            ).fetchall()
+            result_map = {row["address"]: row for row in fetched}
+
+            if normalized_tag_ids and result_map:
+                for row in result_map.values():
+                    mid = int(row["id"])
+                    self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
+                        [(mid, tid) for tid in normalized_tag_ids],
+                    )
+                self._conn.commit()
+
+        created = 0
+        reset = 0
+        for line_no, source, address in valid_items:
+            row = result_map.get(address)
+            if not row:
+                invalid_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "invalid", "reason": "create_failed"}
+                continue
+            record = self._mailbox_record_from_row(row)
+            mb = {"id": record.mailbox_id, "address": record.address, "access_key": record.access_key,
+                  "credential": f"{record.address}----{record.access_key}", "note": record.note,
+                  "created_at": record.created_at, "updated_at": record.updated_at, "active": record.active}
+            if address in existing_set:
+                reset += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "reset", "reason": "ok", "mailbox": mb}
+            else:
+                created += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "created", "reason": "ok", "mailbox": mb}
+
+        results = [results_by_line[k] for k in sorted(results_by_line)]
+        return {"total_lines": len(lines), "accepted_lines": accepted_lines, "created": created, "reset": reset, "skipped": skipped_count, "invalid": invalid_count, "results": results}
 
     def import_mailbox_credentials_csv(self, csv_text: str, *, note: str = "", tag_ids: Optional[list[Any]] = None) -> dict[str, Any]:
         raw_text = str(csv_text or "")
         clean_note = str(note or "").strip()
         if not raw_text.strip():
-            return {
-                "total_lines": 0,
-                "accepted_lines": 0,
-                "created": 0,
-                "updated": 0,
-                "invalid": 0,
-                "results": [],
-            }
+            return {"total_lines": 0, "accepted_lines": 0, "created": 0, "updated": 0, "invalid": 0, "results": []}
 
         lines = raw_text.splitlines()
         if lines and lines[0].startswith("\ufeff"):
             lines[0] = lines[0].lstrip("\ufeff")
         seen_in_request: set[str] = set()
-        results: list[dict[str, Any]] = []
-        created = 0
-        updated = 0
-        invalid = 0
+        results_by_line: dict[int, dict] = {}
         accepted_lines = 0
+        invalid_count = 0
 
+        # Phase 1: validate (no DB access)
+        valid_items: list[tuple[int, str, str, str]] = []
         for line_no, raw_line in enumerate(lines, start=1):
             source = str(raw_line or "").strip()
             if not source:
@@ -1338,164 +1304,97 @@ class MailBridgeStore:
                 address = normalize_address(source)
                 access_key = ""
             if not is_valid_email_address(address):
-                invalid += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "invalid",
-                        "reason": "invalid_address",
-                    }
-                )
+                invalid_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "invalid", "reason": "invalid_address"}
                 continue
             if address in seen_in_request:
-                invalid += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "invalid",
-                        "reason": "duplicate_in_request",
-                    }
-                )
+                invalid_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "invalid", "reason": "duplicate_in_request"}
                 continue
             seen_in_request.add(address)
-            with self._lock:
-                existing = self._conn.execute(
-                    """
-                    SELECT id, address, access_key, active, note, created_at, updated_at
-                    FROM mailbox_credentials
-                    WHERE address = ?
-                    LIMIT 1
-                    """,
-                    (address,),
-                ).fetchone()
-                now = utcnow_iso()
-                if existing:
-                    next_access_key = access_key or str(existing["access_key"] or "")
-                    next_note = clean_note if clean_note else str(existing["note"] or "")
-                    self._conn.execute(
-                        """
-                        UPDATE mailbox_credentials
-                        SET access_key = ?, active = 1, note = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (next_access_key, next_note, now, int(existing["id"] or 0)),
-                    )
-                    self._conn.commit()
-                    row = self._conn.execute(
-                        """
-                        SELECT id, address, access_key, active, note, created_at, updated_at
-                        FROM mailbox_credentials
-                        WHERE id = ?
-                        LIMIT 1
-                        """,
-                        (int(existing["id"] or 0),),
-                    ).fetchone()
-                    if not row:
-                        invalid += 1
-                        results.append(
-                            {
-                                "line": line_no,
-                                "input": source,
-                                "address": address,
-                                "status": "invalid",
-                                "reason": "update_failed",
-                            }
-                        )
-                        continue
-                    record = self._mailbox_record_from_row(row)
-                    if tag_ids:
-                        self.set_mailbox_tags(record.mailbox_id, tag_ids)
-                    updated += 1
-                    results.append(
-                        {
-                            "line": line_no,
-                            "input": source,
-                            "address": record.address,
-                            "status": "updated",
-                            "reason": "ok",
-                            "mailbox": {
-                                "id": record.mailbox_id,
-                                "address": record.address,
-                                "access_key": record.access_key,
-                                "credential": f"{record.address}----{record.access_key}",
-                                "note": record.note,
-                                "created_at": record.created_at,
-                                "updated_at": record.updated_at,
-                                "active": record.active,
-                            },
-                        }
-                    )
-                    continue
-            ok, mailbox, reason = self.create_mailbox_credential(address, note=clean_note)
-            if not ok or not mailbox:
-                invalid += 1
-                results.append(
-                    {
-                        "line": line_no,
-                        "input": source,
-                        "address": address,
-                        "status": "invalid",
-                        "reason": reason,
-                    }
-                )
-                continue
-            if access_key:
-                with self._lock:
-                    self._conn.execute(
-                        """
-                        UPDATE mailbox_credentials
-                        SET access_key = ?, active = 1, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (access_key, utcnow_iso(), mailbox.mailbox_id),
-                    )
-                    self._conn.commit()
-                    row = self._conn.execute(
-                        """
-                        SELECT id, address, access_key, active, note, created_at, updated_at
-                        FROM mailbox_credentials
-                        WHERE id = ?
-                        LIMIT 1
-                        """,
-                        (mailbox.mailbox_id,),
-                    ).fetchone()
-                if row:
-                    mailbox = self._mailbox_record_from_row(row)
-            if tag_ids:
-                self.set_mailbox_tags(mailbox.mailbox_id, tag_ids)
-            created += 1
-            results.append(
-                {
-                    "line": line_no,
-                    "input": source,
-                    "address": mailbox.address,
-                    "status": "created",
-                    "reason": "ok",
-                    "mailbox": {
-                        "id": mailbox.mailbox_id,
-                        "address": mailbox.address,
-                        "access_key": mailbox.access_key,
-                        "credential": f"{mailbox.address}----{mailbox.access_key}",
-                        "note": mailbox.note,
-                        "created_at": mailbox.created_at,
-                        "updated_at": mailbox.updated_at,
-                        "active": mailbox.active,
-                    },
-                }
-            )
+            valid_items.append((line_no, source, address, access_key))
 
-        return {
-            "total_lines": len(lines),
-            "accepted_lines": accepted_lines,
-            "created": created,
-            "updated": updated,
-            "invalid": invalid,
-            "results": results,
-        }
+        if not valid_items:
+            results = [results_by_line[k] for k in sorted(results_by_line)]
+            return {"total_lines": len(lines), "accepted_lines": accepted_lines, "created": 0, "updated": 0, "invalid": invalid_count, "results": results}
+
+        # Phase 2: single lock + single commit for the whole batch
+        now = utcnow_iso()
+        normalized_tag_ids = sorted({int(t) for t in (tag_ids or []) if int(t or 0) > 0})
+        all_addresses = [item[2] for item in valid_items]
+        ph = ",".join("?" * len(all_addresses))
+        result_map: dict[str, Any] = {}
+        existing_map: dict[str, Any] = {}
+
+        with self._lock:
+            existing_rows = self._conn.execute(
+                f"SELECT id, address, access_key, note FROM mailbox_credentials WHERE address IN ({ph})",
+                all_addresses,
+            ).fetchall()
+            existing_map = {row["address"]: dict(row) for row in existing_rows}
+
+            update_rows = [
+                (item[3] or str(existing_map[item[2]]["access_key"] or ""),
+                 clean_note if clean_note else str(existing_map[item[2]]["note"] or ""),
+                 now, existing_map[item[2]]["id"])
+                for item in valid_items if item[2] in existing_map
+            ]
+            # CSV import is the admin ready-to-use path: a row without an explicit
+            # ----key still needs a usable key generated, not left blank.
+            insert_rows = [
+                (item[2], item[3] or generate_access_key(), clean_note, now, now)
+                for item in valid_items if item[2] not in existing_map
+            ]
+
+            if update_rows:
+                self._conn.executemany(
+                    "UPDATE mailbox_credentials SET access_key = ?, note = ?, active = 1, updated_at = ? WHERE id = ?",
+                    update_rows,
+                )
+            if insert_rows:
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO mailbox_credentials (address, access_key, active, status, note, created_at, updated_at) VALUES (?, ?, 1, 'presale', ?, ?, ?)",
+                    insert_rows,
+                )
+            self._conn.commit()
+
+            fetched = self._conn.execute(
+                f"SELECT id, address, access_key, active, note, created_at, updated_at FROM mailbox_credentials WHERE address IN ({ph})",
+                all_addresses,
+            ).fetchall()
+            result_map = {row["address"]: row for row in fetched}
+
+            if normalized_tag_ids and result_map:
+                for row in result_map.values():
+                    mid = int(row["id"])
+                    self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
+                    self._conn.executemany(
+                        "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
+                        [(mid, tid) for tid in normalized_tag_ids],
+                    )
+                self._conn.commit()
+
+        created = 0
+        updated = 0
+        for line_no, source, address, access_key in valid_items:
+            row = result_map.get(address)
+            if not row:
+                invalid_count += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "invalid", "reason": "create_failed"}
+                continue
+            record = self._mailbox_record_from_row(row)
+            mb = {"id": record.mailbox_id, "address": record.address, "access_key": record.access_key,
+                  "credential": f"{record.address}----{record.access_key}", "note": record.note,
+                  "created_at": record.created_at, "updated_at": record.updated_at, "active": record.active}
+            if address in existing_map:
+                updated += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "updated", "reason": "ok", "mailbox": mb}
+            else:
+                created += 1
+                results_by_line[line_no] = {"line": line_no, "input": source, "address": address, "status": "created", "reason": "ok", "mailbox": mb}
+
+        results = [results_by_line[k] for k in sorted(results_by_line)]
+        return {"total_lines": len(lines), "accepted_lines": accepted_lines, "created": created, "updated": updated, "invalid": invalid_count, "results": results}
 
     def get_mailbox_credential_by_id(self, mailbox_id: int) -> Optional[MailboxCredentialRecord]:
         if mailbox_id <= 0:
@@ -1667,13 +1566,16 @@ class MailBridgeStore:
                 "UPDATE mailbox_credentials SET status = 'dead', active = 0, owner_user_id = 0, updated_at = ? WHERE id = ? AND status = 'sold'",
                 (now, old_id),
             )
+            # Dispense a fresh access key with the replacement: available stock
+            # carries an empty key until sold, so without this the buyer's new
+            # credential would be unusable (same point-of-sale rule as redeem).
             updated = self._conn.execute(
                 """
                 UPDATE mailbox_credentials
-                SET status = 'sold', owner_user_id = ?, sold_at = ?, order_id = ?, updated_at = ?
+                SET status = 'sold', access_key = ?, owner_user_id = ?, sold_at = ?, order_id = ?, updated_at = ?
                 WHERE id = ? AND status = 'available'
                 """,
-                (owner_user_id, now, order_id, now, new_id),
+                (generate_access_key(), owner_user_id, now, order_id, now, new_id),
             )
             if int(updated.rowcount or 0) != 1:
                 self._conn.rollback()
@@ -1936,6 +1838,16 @@ class MailBridgeStore:
             if int(used_cursor.rowcount or 0) <= 0:
                 self._conn.rollback()
                 return False, None, "cdk_used"
+
+            # Generate a fresh access key for each dispensed mailbox at point of
+            # sale. Stock imported into the presale pool carries an empty key
+            # until sold, so without this the buyer gets an unusable credential.
+            # Inlined (not reset_mailbox_access_key) to avoid re-entering the lock.
+            for mid in mailbox_ids:
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET access_key = ?, updated_at = ? WHERE id = ?",
+                    (generate_access_key(), now, mid),
+                )
 
             # Link to the user (inlined assign_mailbox body) so the user
             # dashboard and user_has_mailbox checks light up immediately.
@@ -3442,7 +3354,7 @@ el("login-form").onsubmit = async (ev) => {
   <title>邮箱兑换 & 邮件查看</title>
   <style>
     @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
-    :root { --bg:#eef2ff; --card:#ffffff; --line:#e2e8f5; --fg:#1f2937; --primary:#5b5ff6; --primary2:#7c3aed; --accent:#8b5cf6; --muted:#667085; --shadow:0 18px 42px rgba(80,76,160,.12); --good:#157347; --bad:#b42318; }
+    :root { --bg:#eef2ff; --card:#ffffff; --line:#e2e8f5; --fg:#1f2937; --primary:#5b5ff6; --primary2:#7c3aed; --teal:#7c3aed; --accent:#8b5cf6; --muted:#667085; --shadow:0 18px 42px rgba(80,76,160,.12); --good:#157347; --bad:#b42318; }
     * { box-sizing: border-box; }
     body { margin:0; min-height:100vh; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif; color:var(--fg);
       background:
@@ -3492,10 +3404,12 @@ el("login-form").onsubmit = async (ev) => {
     .email-item::before { content:""; position:absolute; inset:0 0 auto 0; height:3px; background:linear-gradient(90deg,var(--primary),var(--accent),#22c55e); opacity:.95; }
     .email-item:hover { transform:translateY(-2px); border-color:#cbd5ff; box-shadow:0 22px 44px rgba(80,76,160,.15); }
     .email-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
-    .email-subject { font-size:17px; font-weight:700; margin:0; line-height:1.45; }
-    .email-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:13px; }
+    .email-top > div { min-width:0; }
+    .email-subject { font-size:17px; font-weight:700; margin:0; line-height:1.45; overflow-wrap:anywhere; }
+    .email-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
+    .email-meta span { min-width:0; overflow-wrap:anywhere; }
     .pill { display:inline-flex; align-items:center; border-radius:999px; padding:4px 10px; background:#f5f7ff; border:1px solid #d8def1; font-size:12px; color:#3b4a67; }
-    .email-preview { margin-top:12px; color:#475467; line-height:1.6; min-height:44px; }
+    .email-preview { margin-top:12px; color:#475467; line-height:1.6; min-height:44px; overflow-wrap:anywhere; }
     .email-actions { display:flex; justify-content:flex-end; margin-top:12px; }
     .admin-entry { margin-top:14px; text-align:center; color:var(--muted); font-size:13px; }
     .admin-entry a { color:var(--primary); font-weight:700; text-decoration:none; }
@@ -3514,7 +3428,7 @@ el("login-form").onsubmit = async (ev) => {
     .close-button { border:none; background:#eef2ff; width:36px; height:36px; border-radius:999px; font-size:22px; cursor:pointer; }
     .modal-body { padding:18px 22px 22px; }
     .email-meta-modal { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; color:#344054; font-size:14px; }
-    .email-meta-modal p { margin:0; }
+    .email-meta-modal p { margin:0; min-width:0; overflow-wrap:anywhere; }
     .modal-header-copy { color:var(--muted); font-size:13px; margin-top:4px; }
     .modal-content-switch { display:flex; gap:8px; flex-wrap:wrap; margin-top:14px; }
     .modal-switch { background:#f4f7ff; color:#284167; border:1px solid #d8e3ff; }
@@ -3696,20 +3610,20 @@ function renderResults(items, total) {
     <article class="email-item" data-id="${item.id}">
       <div class="email-top">
         <div>
-          <h3 class="email-subject">${item.subject || "(无主题)"}</h3>
+          <h3 class="email-subject">${escapeHtml(item.subject) || "(无主题)"}</h3>
           <div class="email-meta">
-            <span class="pill">${typeLabel(item.mail_type)}</span>
-            <span>发件人：${item.from || "-"}</span>
-            <span>收件人：${item.to || "-"}</span>
+            <span class="pill">${escapeHtml(typeLabel(item.mail_type))}</span>
+            <span>发件人：${escapeHtml(item.from) || "-"}</span>
+            <span>收件人：${escapeHtml(item.to) || "-"}</span>
           </div>
         </div>
         <div class="pill">${formatBeijingDateTime(item.received_at)}</div>
       </div>
       <div class="mail-kv">
-        ${item.verification_code ? `<span class="mail-kv-item">验证码 <b>${item.verification_code}</b></span>` : ""}
+        ${item.verification_code ? `<span class="mail-kv-item">验证码 <b>${escapeHtml(item.verification_code)}</b></span>` : ""}
         ${item.invite_link ? `<span class="mail-kv-item">邀请链接 已提取</span>` : ""}
       </div>
-      <div class="email-preview">${item.preview || "（无摘要）"}</div>
+      <div class="email-preview">${escapeHtml(item.preview) || "（无摘要）"}</div>
       <div class="email-actions"><button class="button-ghost" data-open="${item.id}" type="button">查看详情</button></div>
     </article>
   `).join("");
@@ -3991,6 +3905,7 @@ async function redeem() {
         </div></div>
         <div class="email-actions">
           <button class="button-ghost" data-redeem-copy="${escapeHtml(m.credential)}" type="button">复制凭据</button>
+          <button class="button-ghost" data-redeem-copy-api="${escapeHtml(m.address)}----${escapeHtml(m.access_key||m.key||'')}" type="button">复制API地址</button>
           <button class="button-primary" data-redeem-view="${escapeHtml(m.credential)}" type="button">查邮件</button>
         </div>
       </article>`).join("");
@@ -4005,6 +3920,11 @@ el("redeem-result").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button");
   if (!btn) return;
   if (btn.dataset.redeemCopy != null) { await copyText(btn.dataset.redeemCopy); btn.textContent = "已复制"; setTimeout(() => { btn.textContent = "复制凭据"; }, 1200); return; }
+  if (btn.dataset.redeemCopyApi != null) {
+    const [addr, key] = btn.dataset.redeemCopyApi.split("----");
+    const url = `${location.origin}/api/mail/latest?address=${encodeURIComponent(addr)}&key=${encodeURIComponent(key)}`;
+    await copyText(url); btn.textContent = "已复制"; setTimeout(() => { btn.textContent = "复制API地址"; }, 1200); return;
+  }
   if (btn.dataset.redeemView != null) { el("credential-input").value = btn.dataset.redeemView; switchTab("query"); await queryMails(); }
 });
 renderMyMailboxes();
@@ -4021,40 +3941,67 @@ renderMyMailboxes();
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>用户工作台</title>
   <style>
-    @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
-    :root { --bg:#f2f8ff; --card:#fff; --line:#d6e3f2; --fg:#10233e; --primary:#0a67dd; --teal:#00858d; --muted:#5a7190; --good:#006a5a; --bad:#96253a; }
+    @import url("https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+    :root { --bg:#f3f5f8; --panel:#ffffff; --panel-alt:#f8fafc; --line:#dde5ee; --line-strong:#c9d4e1; --fg:#142033; --muted:#62738a; --accent:#2363eb; --accent-soft:#e9f1ff; --ok:#0d7a56; --warn:#b43f2e; --shadow:0 14px 38px rgba(15,23,42,.07); }
     * { box-sizing:border-box; }
-    body { margin:0; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif; color:var(--fg); background:
-      radial-gradient(circle at 86% 18%, #d2ebff, transparent 32%),
-      radial-gradient(circle at 18% 82%, #d8f2f1, transparent 34%),
-      linear-gradient(130deg,#eef6ff,#ffffff 72%); }
-    .top { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.92); backdrop-filter: blur(6px); position:sticky; top:0; z-index:30; }
-    .brand { font-family:"Space Grotesk","Noto Sans SC",sans-serif; font-weight:700; letter-spacing:.4px; }
-    .wrap { max-width:1140px; margin:18px auto; padding:0 14px 16px; display:grid; gap:12px; }
-    .grid { display:grid; grid-template-columns: 320px 1fr; gap:12px; align-items:start; }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 12px 28px rgba(14,41,76,.07); }
-    .title { margin:0; font-family:"Space Grotesk","Noto Sans SC",sans-serif; font-size:20px; }
-    .sub { margin:4px 0 0; color:var(--muted); font-size:13px; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    input,button { font:inherit; border:1px solid #bdd1e6; border-radius:10px; padding:8px 10px; min-height:44px; }
+    body { margin:0; font-family:"IBM Plex Sans","Noto Sans SC",sans-serif; color:var(--fg); background:linear-gradient(180deg,#f7f9fc 0%, var(--bg) 100%); }
+    .top { position:sticky; top:0; z-index:30; display:flex; justify-content:space-between; align-items:center; gap:14px; padding:14px 20px; border-bottom:1px solid var(--line); background:rgba(243,245,248,.92); backdrop-filter:blur(14px); }
+    .brand { font-family:"Manrope","Noto Sans SC",sans-serif; font-size:20px; font-weight:800; letter-spacing:.01em; }
+    .wrap { max-width:1680px; margin:22px auto; padding:0 24px 28px; display:grid; gap:16px; }
+    #dash { display:grid; gap:16px; }
+    .split { display:grid; grid-template-columns:360px minmax(0,1fr); gap:16px; align-items:start; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:22px; padding:20px; box-shadow:var(--shadow); }
+    .panel-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:2px; }
+    .title { margin:0; font-family:"Manrope","Noto Sans SC",sans-serif; font-size:18px; font-weight:800; letter-spacing:.01em; }
+    .sub { margin:6px 0 0; color:var(--muted); font-size:13px; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    input,button { font:inherit; border:1px solid var(--line-strong); border-radius:14px; padding:11px 13px; min-height:44px; background:#fff; color:var(--fg); }
     input { flex:1; min-width:200px; }
-    button { background:linear-gradient(120deg,var(--primary),var(--teal)); color:#fff; border-color:var(--primary); cursor:pointer; font-weight:600; }
-    button.secondary { background:#fff; color:var(--fg); border-color:#bdd1e6; }
-    button.ghost { background:#f5f9ff; color:#11427b; border-color:#c9dcf1; }
-    .mailbox-list { display:grid; gap:8px; margin-top:10px; max-height:430px; overflow:auto; padding-right:4px; }
-    .mailbox-item { display:flex; justify-content:space-between; align-items:center; gap:8px; border:1px solid #cfe0f2; background:#f9fcff; color:#0f345f; border-radius:10px; padding:8px 10px; min-height:44px; cursor:pointer; transition:all .18s ease; }
-    .mailbox-item:hover { transform:translateY(-1px); border-color:#a9c7e7; }
-    .mailbox-item.active { border-color:#4b95e9; background:#ecf5ff; box-shadow:0 6px 16px rgba(32,97,184,.18); }
+    button { width:auto; background:var(--accent); color:#fff; border-color:var(--accent); cursor:pointer; font-weight:700; padding:0 16px; transition:background .18s ease, transform .18s ease; }
+    button:hover { transform:translateY(-1px); background:#1d56cf; border-color:#1d56cf; }
+    button[disabled] { opacity:.6; cursor:not-allowed; transform:none; }
+    button.secondary { background:#fff; color:var(--fg); border-color:var(--line-strong); }
+    button.ghost { background:var(--accent-soft); color:var(--accent); border-color:#d4e2ff; }
     .mono { font-family: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace; font-size:13px; }
-    .status { font-size:13px; min-height:20px; margin-top:8px; color:#18457a; }
-    .status.error { color:var(--bad); }
-    .status.ok { color:var(--good); }
-    .meta { display:grid; grid-template-columns:repeat(2,minmax(160px,1fr)); gap:8px; margin-top:10px; }
-    .meta div { border:1px solid #d8e5f3; border-radius:10px; padding:8px 10px; background:#fafcff; }
-    .meta b { display:block; font-size:12px; color:var(--muted); margin-bottom:2px; }
-    pre { margin:0; padding:12px; border-radius:10px; background:#f7fbff; border:1px solid var(--line); white-space:pre-wrap; word-break:break-word; min-height:220px; max-height:460px; overflow:auto; }
-    .pill { display:inline-block; padding:3px 9px; border-radius:999px; font-size:12px; border:1px solid #c8dbef; background:#f5f9ff; }
-    @media (max-width: 960px) { .grid { grid-template-columns:1fr; } .meta { grid-template-columns:1fr; } }
+    .muted { color:var(--muted); font-size:13px; }
+    .status { font-size:13px; min-height:20px; margin-top:10px; color:var(--muted); }
+    .status.error { color:var(--warn); }
+    .status.ok { color:var(--ok); }
+    .pill { display:inline-flex; align-items:center; min-height:26px; padding:0 10px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:var(--panel-alt); color:var(--muted); font-weight:600; }
+    .mailbox-list { display:grid; gap:10px; margin-top:12px; }
+    .mailbox-item { display:grid; gap:8px; border:1px solid var(--line); background:var(--panel-alt); border-radius:16px; padding:12px 14px; cursor:pointer; transition:border-color .15s ease, background .15s ease; }
+    .mailbox-item:hover { border-color:var(--line-strong); }
+    .mailbox-item.selected { border-color:var(--accent); background:var(--accent-soft); }
+    .mailbox-item .cred { word-break:break-all; }
+    .inbox-list { display:grid; gap:10px; margin-top:12px; }
+    .inbox-empty { color:var(--muted); font-size:14px; padding:22px 6px; text-align:center; }
+    .inbox-item { width:100%; text-align:left; display:grid; gap:5px; cursor:pointer; background:var(--panel-alt); border:1px solid var(--line); border-radius:16px; padding:12px 14px; color:var(--fg); min-height:0; }
+    .inbox-item:hover { border-color:var(--accent); background:#fff; transform:none; }
+    .inbox-top { display:flex; justify-content:space-between; gap:10px; align-items:baseline; }
+    .inbox-subject { font-family:"IBM Plex Sans","Noto Sans SC",sans-serif; font-weight:700; font-size:14px; overflow-wrap:anywhere; }
+    .inbox-date { color:var(--muted); font-size:12px; white-space:nowrap; flex-shrink:0; }
+    .inbox-from { font-size:13px; color:var(--muted); overflow-wrap:anywhere; }
+    .inbox-preview { font-size:13px; color:var(--muted); display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+    .inbox-code { justify-self:start; background:var(--accent-soft); color:var(--accent); border-color:#d4e2ff; }
+    .mailbox-tags { display:flex; gap:6px; flex-wrap:wrap; }
+    .mailbox-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .mailbox-actions button { min-height:38px; padding:0 13px; font-size:14px; }
+    .modal { position:fixed; inset:0; background:rgba(15,23,42,.46); display:none; align-items:center; justify-content:center; padding:18px; z-index:60; backdrop-filter:blur(8px); }
+    .modal.open { display:flex; }
+    .modal-dialog { width:min(900px,100%); max-height:92vh; overflow:hidden; background:#fff; border:1px solid var(--line); border-radius:24px; box-shadow:0 28px 84px rgba(15,23,42,.22); }
+    .modal-content { display:grid; grid-template-rows:auto 1fr; max-height:92vh; }
+    .modal-header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; padding:18px 20px; border-bottom:1px solid var(--line); }
+    .modal-title { margin:0; font-family:"Manrope","Noto Sans SC",sans-serif; font-size:22px; font-weight:800; min-width:0; overflow-wrap:anywhere; }
+    .modal-header-copy { margin-top:4px; color:var(--muted); font-size:13px; }
+    .modal-body { padding:18px 20px 22px; overflow:auto; }
+    .email-meta-modal { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px 18px; color:#344054; }
+    .email-meta-modal p { margin:0; line-height:1.7; min-width:0; overflow-wrap:anywhere; }
+    .modal-content-switch { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+    .modal-switch { background:var(--accent-soft); color:var(--accent); border-color:#d4e2ff; }
+    .modal-switch.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    iframe { width:100%; min-height:50vh; border:1px solid var(--line); border-radius:16px; background:#fff; }
+    .modal-fallback { margin:0; padding:16px; border-radius:16px; background:#0f172a; color:#dbe5f4; white-space:pre-wrap; word-break:break-word; min-height:50vh; overflow:auto; display:none; }
+    @media (max-width: 560px) { .wrap { margin:14px auto; } .email-meta-modal { grid-template-columns:1fr; } }
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition:none !important; animation:none !important; } }
   </style>
 </head>
@@ -4070,10 +4017,10 @@ renderMyMailboxes();
 
   <main class="wrap">
     <!-- 未登录：登录 / 注册 -->
-    <section id="auth-gate" class="card" style="display:none; max-width:460px; margin:40px auto;">
+    <section id="auth-gate" class="panel" style="display:none; max-width:460px; margin:24px auto 0;">
       <h2 class="title" id="auth-title">登录账号</h2>
       <p class="sub">登录后即可使用 CDK 兑换邮箱、查看已购邮箱的邮件。</p>
-      <div class="row" style="margin-top:10px; flex-direction:column; align-items:stretch; gap:8px;">
+      <div class="row" style="margin-top:14px; flex-direction:column; align-items:stretch; gap:10px;">
         <input id="auth-user" placeholder="用户名" autocomplete="username">
         <input id="auth-pass" type="password" placeholder="密码（至少6位）" autocomplete="current-password">
         <button id="btn-auth-submit">登录</button>
@@ -4084,43 +4031,69 @@ renderMyMailboxes();
 
     <!-- 已登录：兑换 + 我的邮箱 -->
     <div id="dash" style="display:none;">
-      <section class="card">
+      <section class="panel">
         <h2 class="title">兑换 CDK 卡密</h2>
-        <p class="sub">输入卡密兑换邮箱，兑换成功后邮箱会出现在下方「我的邮箱」中。</p>
-        <div class="row" style="margin-top:10px">
+        <p class="sub">输入卡密兑换邮箱，兑换成功后邮箱会出现在左侧「我的邮箱」中。</p>
+        <div class="row" style="margin-top:14px">
           <input id="cdk-code" class="mono" placeholder="CDK-XXXXX-XXXXX-XXXXX-XXXXX">
           <button id="btn-redeem">兑换</button>
         </div>
         <div id="redeem-status" class="status"></div>
       </section>
 
-      <section class="grid">
-        <aside class="card">
-          <div class="row" style="justify-content:space-between">
-            <h3 style="margin:0">我的邮箱</h3>
+      <div class="split">
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="title">我的邮箱</h2>
             <button id="btn-refresh" class="ghost">刷新</button>
           </div>
-          <p class="sub">点击「查看邮件」读取最新邮件；点击「复制」复制 邮箱----密钥。</p>
+          <p class="sub">点击邮箱卡片查看收件箱并复制地址；按钮可复制凭据 / API、重置密钥。</p>
+          <input id="mailbox-search" placeholder="搜索邮箱地址 / 标签" style="width:100%; margin-top:12px;">
           <div id="mailbox-list" class="mailbox-list"></div>
           <div id="status" class="status"></div>
-        </aside>
-        <section class="card">
-          <div class="row" style="justify-content:space-between">
-            <h3 style="margin:0">最新邮件</h3>
-            <span id="mail-type" class="pill">暂无类型</span>
-          </div>
-          <div class="meta">
-            <div><b>邮箱</b><span id="m-to">-</span></div>
-            <div><b>发件人</b><span id="m-from">-</span></div>
-            <div><b>主题</b><span id="m-subject">-</span></div>
-            <div><b>接收时间</b><span id="m-time">-</span></div>
-          </div>
-          <div style="margin-top:10px"><b style="font-size:12px;color:var(--muted)">正文</b></div>
-          <pre id="result">请选择一个邮箱查看内容</pre>
         </section>
-      </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2 class="title">收件箱 <span id="inbox-addr" class="muted" style="font-weight:600; font-size:13px;"></span></h2>
+            <button id="btn-inbox-refresh" class="ghost" style="display:none">刷新</button>
+          </div>
+          <div id="inbox-list" class="inbox-list"></div>
+          <div id="inbox-status" class="status"></div>
+        </section>
+      </div>
     </div>
   </main>
+
+  <div id="emailModal" class="modal">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div>
+            <h2 id="modalSubject" class="modal-title">邮件内容</h2>
+            <div class="modal-header-copy">支持 HTML 正文预览与纯文本回退</div>
+          </div>
+          <button type="button" class="secondary" id="closeModalButton" aria-label="关闭">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div class="email-meta-modal">
+            <p><strong>发件人：</strong><span id="modalFrom"></span></p>
+            <p><strong>收件人：</strong><span id="modalTo"></span></p>
+            <p><strong>日期：</strong><span id="modalDate"></span></p>
+            <p><strong>类型：</strong><span id="modalType"></span></p>
+          </div>
+          <div class="modal-content-switch">
+            <button type="button" id="viewRenderedButton" class="modal-switch active">正文预览</button>
+            <button type="button" id="viewRawButton" class="modal-switch secondary">纯文本</button>
+          </div>
+          <div style="margin-top:14px">
+            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
+            <pre id="emailBodyFallback" class="modal-fallback"></pre>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 <script>
 async function api(path, opts = {}) {
   const r = await fetch(path, { credentials: "include", headers: { "Content-Type": "application/json" }, ...opts });
@@ -4130,8 +4103,9 @@ async function api(path, opts = {}) {
   return { status: r.status, data };
 }
 function el(id) { return document.getElementById(id); }
-let selectedMailbox = "";
 let cachedMailboxes = [];
+let selectedAddress = "";
+let currentInboxEmails = [];
 
 function escapeHtml(value) {
   return String(value == null ? "" : value)
@@ -4183,96 +4157,203 @@ function setAuthStatus(text, kind = "") {
   if (kind) node.classList.add(kind);
 }
 
-function setMailDetails(email) {
-  if (!email) {
-    el("mail-type").textContent = "暂无类型";
-    el("m-to").textContent = "-";
-    el("m-from").textContent = "-";
-    el("m-subject").textContent = "-";
-    el("m-time").textContent = "-";
-    el("result").textContent = "该邮箱暂无邮件";
+let currentDetailEmail = null;
+
+function closeModal() {
+  el("emailModal").classList.remove("open");
+  el("emailBodyFrame").src = "about:blank";
+  currentDetailEmail = null;
+}
+
+function setModalView(view) {
+  const email = currentDetailEmail || {};
+  const frame = el("emailBodyFrame");
+  const fallback = el("emailBodyFallback");
+  const rawButton = el("viewRawButton");
+  const renderedButton = el("viewRenderedButton");
+  const showRaw = view === "raw";
+  rawButton.classList.toggle("active", showRaw);
+  renderedButton.classList.toggle("active", !showRaw);
+  rawButton.classList.toggle("secondary", !showRaw);
+  renderedButton.classList.toggle("secondary", showRaw);
+  if (showRaw) {
+    frame.style.display = "none";
+    fallback.style.display = "block";
+    fallback.textContent = email.text || email.body || "（无正文）";
     return;
   }
-  el("mail-type").textContent = email.mail_type || "未分类";
-  el("m-to").textContent = email.to || "-";
-  el("m-from").textContent = email.from || "-";
-  el("m-subject").textContent = email.subject || "-";
-  el("m-time").textContent = formatBeijingDateTime(email.received_at);
-  el("result").textContent = email.text || email.body || "（无正文）";
+  const html = String(email.html || "").trim();
+  if (html) {
+    fallback.style.display = "none";
+    frame.style.display = "block";
+    frame.srcdoc = html;
+    return;
+  }
+  frame.style.display = "none";
+  fallback.style.display = "block";
+  fallback.textContent = email.text || email.body || "（无正文）";
+}
+
+function openMailModal(email, address) {
+  currentDetailEmail = email || null;
+  if (!email) {
+    el("modalSubject").textContent = "该邮箱暂无邮件";
+    el("modalFrom").textContent = "-";
+    el("modalTo").textContent = address || "-";
+    el("modalDate").textContent = "-";
+    el("modalType").textContent = "-";
+  } else {
+    el("modalSubject").textContent = email.subject || "(无主题)";
+    el("modalFrom").textContent = email.from || "-";
+    el("modalTo").textContent = email.to || address || "-";
+    el("modalDate").textContent = formatBeijingDateTime(email.received_at);
+    el("modalType").textContent = email.mail_type || "未分类";
+  }
+  setModalView("rendered");
+  el("emailModal").classList.add("open");
 }
 
 function renderMailboxItems(mailboxes) {
   const list = el("mailbox-list");
   list.innerHTML = "";
   if (!mailboxes.length) {
-    list.innerHTML = '<div class="sub">你还没有邮箱，请使用上方 CDK 兑换。</div>';
+    list.innerHTML = cachedMailboxes.length
+      ? '<div class="sub">未找到匹配的邮箱。</div>'
+      : '<div class="sub">你还没有邮箱，请使用上方 CDK 兑换。</div>';
     return;
   }
   for (const m of mailboxes) {
     const address = m.address || "";
     const credential = m.credential || `${address}----${m.access_key || ""}`;
+    const apiCred = `${address}----${m.access_key || ""}`;
     const tags = Array.isArray(m.tags) ? m.tags.map((t) => t.name).filter(Boolean) : [];
     const item = document.createElement("div");
-    item.className = "mailbox-item" + (address === selectedMailbox ? " active" : "");
-    item.style.flexDirection = "column";
-    item.style.alignItems = "stretch";
-    item.style.cursor = "default";
+    item.className = "mailbox-item" + (address === selectedAddress ? " selected" : "");
+    item.setAttribute("data-address", address);
     item.innerHTML = `
-      <div class="mono" style="word-break:break-all">${escapeHtml(credential)}</div>
-      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:6px;">
-        ${tags.map((t) => `<span class="pill">${escapeHtml(t)}</span>`).join("")}
-      </div>
-      <div style="display:flex; gap:8px; margin-top:8px;">
-        <button type="button" class="ghost" data-view-mail="${escapeHtml(address)}">查看邮件</button>
-        <button type="button" class="secondary" data-copy="${escapeHtml(credential)}">复制</button>
-        <button type="button" class="ghost" data-reset-key="${escapeHtml(address)}">重置密钥</button>
+      <div class="mono cred">${escapeHtml(address)}</div>
+      ${tags.length ? `<div class="mailbox-tags">${tags.map((t) => `<span class="pill">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
+      <div class="mailbox-actions">
+        <button type="button" class="secondary" data-copy="${escapeHtml(credential)}">复制凭证</button>
+        <button type="button" class="secondary" data-copy-api="${escapeHtml(apiCred)}">API接码</button>
+        <button type="button" class="secondary" data-reset-key="${escapeHtml(address)}">重置密钥</button>
       </div>`;
     list.appendChild(item);
   }
 }
 
+function filteredMailboxes() {
+  const q = (el("mailbox-search").value || "").trim().toLowerCase();
+  if (!q) return cachedMailboxes;
+  return cachedMailboxes.filter((m) => {
+    const addr = String(m.address || "").toLowerCase();
+    const tags = (Array.isArray(m.tags) ? m.tags.map((t) => t.name) : []).join(" ").toLowerCase();
+    return addr.includes(q) || tags.includes(q);
+  });
+}
+function rerenderMailboxes() { renderMailboxItems(filteredMailboxes()); }
+
 async function loadMailboxes() {
   const res = await api("/web/me/mailboxes");
-  if (res.status === 200 && res.data.ok) {
-    cachedMailboxes = res.data.mailboxes || [];
-    if (!selectedMailbox && cachedMailboxes.length > 0) {
-      selectedMailbox = cachedMailboxes[0].address || "";
-    }
-    renderMailboxItems(cachedMailboxes);
-    setStatus(`已加载 ${cachedMailboxes.length} 个邮箱`, "ok");
-    return cachedMailboxes;
+  if (!(res.status === 200 && res.data.ok)) {
+    setStatus(`加载邮箱列表失败: ${res.data.error || "操作失败"}`, "error");
+    cachedMailboxes = [];
+    renderMailboxItems([]);
+    renderInbox(null);
+    return [];
   }
-  setStatus(`加载邮箱列表失败: ${res.data.error || "操作失败"}`, "error");
-  renderMailboxItems([]);
-  return [];
+  cachedMailboxes = res.data.mailboxes || [];
+  // 选中态:保留当前选中,否则默认第一个
+  const stillThere = cachedMailboxes.some((m) => m.address === selectedAddress);
+  if (!stillThere) selectedAddress = cachedMailboxes.length ? cachedMailboxes[0].address : "";
+  rerenderMailboxes();
+  setStatus(`共 ${cachedMailboxes.length} 个邮箱`, cachedMailboxes.length ? "ok" : "");
+  if (selectedAddress) await loadInbox(selectedAddress);
+  else { el("inbox-addr").textContent = ""; el("btn-inbox-refresh").style.display = "none"; renderInbox(null); setInboxStatus(""); }
+  return cachedMailboxes;
 }
 
-async function queryMailbox(address) {
-  const addressRaw = (address || "").trim();
-  if (!addressRaw) { setStatus("请先选择邮箱", "error"); return; }
-  selectedMailbox = addressRaw;
-  renderMailboxItems(cachedMailboxes);
-  setStatus("查询中...", "");
-  const res = await api(`/web/me/latest?address=${encodeURIComponent(addressRaw)}`);
+function setInboxStatus(text, kind = "") {
+  const node = el("inbox-status");
+  if (!node) return;
+  node.textContent = text;
+  node.classList.remove("ok", "error");
+  if (kind) node.classList.add(kind);
+}
+
+function inboxPreview(email) {
+  const raw = String(email.text || email.body || "").replace(/\\s+/g, " ").trim();
+  return raw.slice(0, 140);
+}
+
+function renderInbox(emails) {
+  const list = el("inbox-list");
+  list.innerHTML = "";
+  if (emails === null) { list.innerHTML = '<div class="inbox-empty">请选择左侧邮箱查看邮件。</div>'; return; }
+  if (!emails.length) { list.innerHTML = '<div class="inbox-empty">该邮箱暂无邮件。</div>'; return; }
+  emails.forEach((email, i) => {
+    const code = String(email.verification_code || "").trim();
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "inbox-item";
+    item.setAttribute("data-email-index", String(i));
+    item.innerHTML = `
+      <div class="inbox-top">
+        <span class="inbox-subject">${escapeHtml(email.subject || "(无主题)")}</span>
+        <span class="inbox-date">${escapeHtml(formatBeijingDateTime(email.received_at))}</span>
+      </div>
+      <div class="inbox-from">${escapeHtml(email.from || "未知发件人")}</div>
+      <div class="inbox-preview">${escapeHtml(inboxPreview(email))}</div>
+      ${code ? `<span class="pill inbox-code">验证码 ${escapeHtml(code)}</span>` : ""}`;
+    list.appendChild(item);
+  });
+}
+
+async function loadInbox(address) {
+  const addr = (address || "").trim();
+  if (!addr) return;
+  el("inbox-addr").textContent = `· ${addr}`;
+  el("btn-inbox-refresh").style.display = "";
+  setInboxStatus("加载中...", "");
+  el("inbox-list").innerHTML = '<div class="inbox-empty">加载中…</div>';
+  const res = await api(`/web/me/messages?address=${encodeURIComponent(addr)}`);
   if (res.status === 200 && res.data.ok) {
-    setMailDetails(res.data.email);
-    setStatus("查询成功", "ok");
+    currentInboxEmails = res.data.emails || [];
+    renderInbox(currentInboxEmails);
+    setInboxStatus(currentInboxEmails.length ? `共 ${currentInboxEmails.length} 封邮件` : "", currentInboxEmails.length ? "ok" : "");
     return;
   }
-  if (res.status === 403) setStatus("该邮箱不属于当前账号", "error");
-  else setStatus(`查询失败: ${res.data.error || "操作失败"}`, "error");
-  setMailDetails(null);
+  currentInboxEmails = [];
+  renderInbox([]);
+  if (res.status === 403) setInboxStatus("该邮箱不属于当前账号", "error");
+  else setInboxStatus(`加载失败: ${res.data.error || "操作失败"}`, "error");
+}
+
+async function selectMailbox(address) {
+  const addr = (address || "").trim();
+  if (!addr) return;
+  selectedAddress = addr;
+  for (const node of el("mailbox-list").querySelectorAll(".mailbox-item")) {
+    node.classList.toggle("selected", node.getAttribute("data-address") === addr);
+  }
+  await loadInbox(addr);
 }
 
 el("mailbox-list").addEventListener("click", async (ev) => {
   const t = ev.target;
   if (!t || typeof t.getAttribute !== "function") return;
-  const viewAddr = t.getAttribute("data-view-mail");
-  if (viewAddr) { await queryMailbox(viewAddr); return; }
   const copyVal = t.getAttribute("data-copy");
   if (copyVal) {
     const ok = await copyText(copyVal);
     setStatus(ok ? "已复制 邮箱----密钥" : "复制失败，请手动选择文本复制", ok ? "ok" : "error");
+    return;
+  }
+  const copyApiVal = t.getAttribute("data-copy-api");
+  if (copyApiVal) {
+    const [addr, key] = copyApiVal.split("----");
+    const url = `${location.origin}/api/mail/latest?address=${encodeURIComponent(addr)}&key=${encodeURIComponent(key)}`;
+    const ok = await copyText(url);
+    setStatus(ok ? "已复制 API 取件地址" : "复制失败，请手动复制", ok ? "ok" : "error");
     return;
   }
   const resetAddr = t.getAttribute("data-reset-key");
@@ -4286,9 +4367,32 @@ el("mailbox-list").addEventListener("click", async (ev) => {
     } else {
       setStatus(`重置失败: ${res.data.error || "操作失败"}`, "error");
     }
+    return;
   }
+  // 点击卡片空白处:选中(加载右侧收件箱)并复制邮箱地址
+  const item = typeof t.closest === "function" ? t.closest(".mailbox-item") : null;
+  const addr = item ? item.getAttribute("data-address") : null;
+  if (!addr) return;
+  await selectMailbox(addr);
+  const ok = await copyText(addr);
+  setStatus(ok ? "已复制邮箱地址" : "复制失败，请手动复制", ok ? "ok" : "error");
 });
+
+el("inbox-list").addEventListener("click", (ev) => {
+  const target = ev.target && typeof ev.target.closest === "function" ? ev.target.closest(".inbox-item") : null;
+  if (!target) return;
+  const idx = parseInt(target.getAttribute("data-email-index"), 10);
+  if (!Number.isNaN(idx) && currentInboxEmails[idx]) openMailModal(currentInboxEmails[idx], selectedAddress);
+});
+
+el("mailbox-search").addEventListener("input", rerenderMailboxes);
 el("btn-refresh").onclick = async () => { await loadMailboxes(); };
+el("btn-inbox-refresh").onclick = async () => { if (selectedAddress) await loadInbox(selectedAddress); };
+el("closeModalButton").onclick = closeModal;
+el("viewRawButton").onclick = () => setModalView("raw");
+el("viewRenderedButton").onclick = () => setModalView("rendered");
+el("emailModal").addEventListener("click", (ev) => { if (ev.target === el("emailModal")) closeModal(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeModal(); });
 
 el("btn-redeem").onclick = async () => {
   const code = el("cdk-code").value.trim();
@@ -4302,7 +4406,6 @@ el("btn-redeem").onclick = async () => {
     setRedeemStatus(`兑换成功，已发放 ${boxes.length} 个邮箱`, "ok");
     el("cdk-code").value = "";
     await loadMailboxes();
-    if (boxes.length) await queryMailbox(boxes[0].address);
   } else {
     const map = {
       cdk_not_found: "卡密不存在", cdk_used: "卡密已被使用", cdk_expired: "卡密已过期",
@@ -4393,9 +4496,7 @@ async function showDashboard(user) {
   el("btn-change-pass").style.display = "";
   el("btn-logout").style.display = "";
   el("who").textContent = `当前用户: ${user.username}`;
-  const mailboxes = await loadMailboxes();
-  if (mailboxes.length > 0) await queryMailbox(selectedMailbox);
-  else setMailDetails(null);
+  await loadMailboxes();
 }
 
 async function boot() {
@@ -4540,10 +4641,11 @@ boot();
     .mail-item::before { content:""; position:absolute; inset:0 0 auto 0; height:3px; background:linear-gradient(90deg,var(--accent),#7c3aed,#22c55e); opacity:.95; }
     .mail-item:hover { transform:translateY(-2px); border-color:#cbd5ff; box-shadow:0 22px 44px rgba(80,76,160,.15); }
     .mail-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
-    .mail-subject { font-size:17px; font-weight:700; margin:0; line-height:1.45; }
-    .mail-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:13px; }
+    .mail-top > div { min-width:0; }
+    .mail-subject { font-size:17px; font-weight:700; margin:0; line-height:1.45; overflow-wrap:anywhere; }
+    .mail-meta { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; color:var(--muted); font-size:13px; overflow-wrap:anywhere; }
     .mail-preview { margin:12px 0 0; color:#344054; line-height:1.7; white-space:pre-wrap; word-break:break-word; }
-    .mail-address { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:0 10px; border-radius:999px; background:#f8fafc; border:1px solid var(--line); font-size:12px; color:#475467; }
+    .mail-address { display:inline-flex; align-items:center; gap:6px; min-height:28px; padding:0 10px; border-radius:999px; background:#f8fafc; border:1px solid var(--line); font-size:12px; color:#475467; max-width:100%; overflow-wrap:anywhere; }
     .mail-pagination { display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; align-items:center; padding:14px 20px 18px; border-top:1px solid var(--line); }
     .modal { position:fixed; inset:0; background:rgba(15,23,42,.46); display:none; align-items:center; justify-content:center; padding:18px; z-index:60; backdrop-filter:blur(8px); }
     .modal.open { display:flex; }
@@ -4554,7 +4656,7 @@ boot();
     .modal-header-copy { margin-top:4px; color:var(--muted); font-size:13px; }
     .modal-body { padding:18px 20px 22px; overflow:auto; }
     .email-meta-modal { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px 18px; color:#344054; }
-    .email-meta-modal p { margin:0; line-height:1.7; }
+    .email-meta-modal p { margin:0; line-height:1.7; min-width:0; overflow-wrap:anywhere; }
     .modal-content-switch { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
     .modal-switch.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     iframe { width:100%; min-height:58vh; border:1px solid var(--line); border-radius:16px; background:#fff; }
@@ -6135,6 +6237,32 @@ el("cdk-next-page").onclick = () => {
                 },
             )
             return
+        if parsed.path == "/web/me/messages":
+            session_user = self._require_session_user()
+            if not session_user:
+                return
+            query = parse_qs(parsed.query or "", keep_blank_values=True)
+            address = normalize_address((query.get("address") or [""])[0])
+            if not address:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_address"})
+                return
+            if not self.app.store.user_has_mailbox(int(session_user["user_id"]), address):
+                self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "not_owned"})
+                return
+            limit = self._parse_int((query.get("limit") or ["30"])[0], default=30, minimum=1, maximum=200)
+            offset = self._parse_int((query.get("offset") or ["0"])[0], default=0, minimum=0, maximum=10_000_000)
+            # ponytail: 整条 detail payload 直接进列表，邮箱邮件量小,点开免二次请求;量大再拆 summary+detail
+            records = self.app.store.list_messages(address, limit=limit, offset=offset)
+            total = self.app.store.count_messages(address)
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "emails": [self._mail_detail_payload(record) for record in records],
+                    "total": total,
+                },
+            )
+            return
         if parsed.path == "/web/me/redemptions":
             session_user = self._require_session_user()
             if not session_user:
@@ -6369,25 +6497,59 @@ el("cdk-next-page").onclick = () => {
                 },
             )
             return
-        if parsed.path != "/api/latest":
-            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+        if parsed.path == "/api/latest":
+            if not self._require_auth(self.app.api_token):
+                return
+            query = parse_qs(parsed.query)
+            address = self._normalize_query_address((query.get("address") or [""])[0])
+            if not address:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_address"})
+                return
+            record = self.app.store.latest_message(address)
+            if not record:
+                self._send_json(HTTPStatus.OK, {"ok": True, "email": None})
+                return
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "email": {
+                        "id": record.message_id,
+                        "to": record.address,
+                        "from": record.from_address,
+                        "subject": record.subject,
+                        "text": record.text or record.body,
+                        "html": record.html,
+                        "body": record.body,
+                        "received_at": record.received_at,
+                        "created_at": record.received_at,
+                        "verification_code": record.verification_code,
+                        "mail_type": record.mail_type,
+                        "invite_link": record.invite_link,
+                        "process_status": record.process_status,
+                    },
+                },
+            )
             return
-        if not self._require_auth(self.app.api_token):
-            return
-        query = parse_qs(parsed.query)
-        address = self._normalize_query_address((query.get("address") or [""])[0])
-        if not address:
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_address"})
-            return
-        record = self.app.store.latest_message(address)
-        if not record:
-            self._send_json(HTTPStatus.OK, {"ok": True, "email": None})
-            return
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "email": {
+        if parsed.path == "/api/mail/latest":
+            qs = parse_qs(parsed.query)
+            credential_raw = (qs.get("credential") or [""])[0]
+            address_raw = (qs.get("address") or [""])[0]
+            key_raw = (qs.get("key") or qs.get("access_key") or [""])[0]
+            address, access_key = parse_mailbox_credential(credential_raw)
+            if not address:
+                address = normalize_address(address_raw)
+            if not access_key:
+                access_key = key_raw.strip()
+            verified, credential, reason = self.app.store.verify_mailbox_access(address, access_key)
+            if not verified or not credential:
+                status = HTTPStatus.BAD_REQUEST if reason in {"missing_address", "missing_access_key"} else HTTPStatus.UNAUTHORIZED
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            record = self.app.store.latest_message(credential.address)
+            email_payload = None
+            if record:
+                email_payload = {
                     "id": record.message_id,
                     "to": record.address,
                     "from": record.from_address,
@@ -6401,9 +6563,14 @@ el("cdk-next-page").onclick = () => {
                     "mail_type": record.mail_type,
                     "invite_link": record.invite_link,
                     "process_status": record.process_status,
-                },
-            },
-        )
+                }
+            self._send_json(HTTPStatus.OK, {
+                "ok": True,
+                "mailbox": {"id": credential.mailbox_id, "address": credential.address, "active": credential.active},
+                "email": email_payload,
+            })
+            return
+        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
