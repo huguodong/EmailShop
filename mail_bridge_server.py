@@ -1519,6 +1519,46 @@ class MailBridgeStore:
             return False, None, "mailbox_not_found"
         return True, self._mailbox_record_from_row(fresh), "ok"
 
+    def delete_user_mailboxes(
+        self, user_id: int, addresses: list[str]
+    ) -> tuple[bool, Optional[dict[str, Any]], str]:
+        """Buyer self-service: remove mailboxes from the user's list by clearing
+        ownership (owner_user_id -> 0) and dropping the user_mailboxes link. The
+        mailbox row itself is kept, so re-redeeming the original CDK reclaims it
+        (the redeem claim path picks up owner_user_id == 0). Only the caller's own
+        mailboxes are touched; others land in `skipped`. Inlined SQL under the
+        single non-reentrant lock — do NOT call unassign_mailbox etc. here."""
+        clean_user_id = int(user_id or 0)
+        if clean_user_id <= 0:
+            return False, None, "invalid_user"
+        wanted = [normalize_address(a) for a in (addresses or [])]
+        wanted = [a for a in wanted if a]
+        if not wanted:
+            return False, None, "missing_address"
+        now = utcnow_iso()
+        removed: list[str] = []
+        skipped: list[str] = []
+        with self._lock:
+            for address in wanted:
+                row = self._conn.execute(
+                    "SELECT id, owner_user_id FROM mailbox_credentials WHERE address = ? LIMIT 1",
+                    (address,),
+                ).fetchone()
+                if not row or int(row["owner_user_id"] or 0) != clean_user_id:
+                    skipped.append(address)
+                    continue
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET owner_user_id = 0, updated_at = ? WHERE id = ?",
+                    (now, int(row["id"] or 0)),
+                )
+                self._conn.execute(
+                    "DELETE FROM user_mailboxes WHERE user_id = ? AND address = ?",
+                    (clean_user_id, address),
+                )
+                removed.append(address)
+            self._conn.commit()
+        return True, {"deleted": len(removed), "removed": removed, "skipped": skipped}, "ok"
+
     def replace_sold_mailbox(
         self, address: str
     ) -> tuple[bool, Optional[MailboxCredentialRecord], str]:
@@ -1756,15 +1796,62 @@ class MailBridgeStore:
                 return False, None, "cdk_not_found"
             if int(cdk["active"] or 0) != 1:
                 return False, None, "cdk_disabled"
+
+            cdk_id = int(cdk["id"] or 0)
+            tag_id = int(cdk["tag_id"] or 0)
+            quantity = max(1, int(cdk["quantity"] or 1))
+
+            # Idempotent retrieval: once a code has dispensed mailboxes it is
+            # permanently bound to them. Any later redemption returns the SAME
+            # mailbox(es) with their current credentials — so a buyer who cleared
+            # their browser cache can recover by re-entering the code. No new
+            # stock is consumed; expiry/used_count are ignored (already paid).
+            # Inlined SQL only (the global lock is non-reentrant).
+            prior = self._conn.execute(
+                "SELECT addresses FROM cdk_redemptions WHERE cdk_id = ? AND status = 'success' ORDER BY id ASC LIMIT 1",
+                (cdk_id,),
+            ).fetchone()
+            if prior:
+                bound = [a for a in json.loads(prior["addresses"] or "[]") if a]
+                if clean_user_id > 0:
+                    for address in bound:
+                        # Claim if currently unowned (e.g. first redeemed anonymously),
+                        # and always surface in this buyer's dashboard.
+                        self._conn.execute(
+                            "UPDATE mailbox_credentials SET owner_user_id = ?, "
+                            "sold_at = CASE WHEN sold_at IS NULL OR sold_at = '' THEN ? ELSE sold_at END, "
+                            "updated_at = ? WHERE address = ? AND (owner_user_id IS NULL OR owner_user_id = 0)",
+                            (clean_user_id, now, now, address),
+                        )
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO user_mailboxes (user_id, address, created_at) VALUES (?, ?, ?)",
+                            (clean_user_id, address, now),
+                        )
+                reissue_ph = ",".join("?" for _ in bound) or "NULL"
+                dispensed = self._conn.execute(
+                    f"SELECT id, address, access_key FROM mailbox_credentials "
+                    f"WHERE address IN ({reissue_ph}) ORDER BY id ASC",
+                    tuple(bound),
+                ).fetchall()
+                self._conn.commit()
+                if not dispensed:
+                    return False, None, "mailbox_unavailable"
+                mailboxes = [
+                    {
+                        "id": int(r["id"] or 0),
+                        "address": str(r["address"] or ""),
+                        "access_key": str(r["access_key"] or ""),
+                        "credential": f"{r['address']}----{r['access_key']}",
+                    }
+                    for r in dispensed
+                ]
+                return True, {"redemption_id": 0, "quantity": len(mailboxes), "mailboxes": mailboxes, "reused": True}, "ok"
+
             if int(cdk["used_count"] or 0) >= int(cdk["max_uses"] or 1):
                 return False, None, "cdk_used"
             expires_at = str(cdk["expires_at"] or "")
             if expires_at and expires_at <= now:
                 return False, None, "cdk_expired"
-
-            cdk_id = int(cdk["id"] or 0)
-            tag_id = int(cdk["tag_id"] or 0)
-            quantity = max(1, int(cdk["quantity"] or 1))
 
             if tag_id > 0:
                 rows = self._conn.execute(
@@ -1880,7 +1967,7 @@ class MailBridgeStore:
             }
             for r in dispensed
         ]
-        return True, {"redemption_id": order_id, "quantity": quantity, "mailboxes": mailboxes}, "ok"
+        return True, {"redemption_id": order_id, "quantity": quantity, "mailboxes": mailboxes, "reused": False}, "ok"
 
     def list_cdks(
         self,
@@ -3906,6 +3993,7 @@ function getRedeemErrorMessage(code) {
   if (c === "missing_code") return "请输入卡密";
   if (c === "too_many_attempts") return "操作过于频繁，请稍后再试";
   if (c === "payload_too_large") return "请求内容过大";
+  if (c === "mailbox_unavailable") return "该卡密绑定的邮箱已不可用，请联系卖家";
   return "兑换失败，请稍后重试";
 }
 function setRedeemStatus(text, kind = "") {
@@ -3922,7 +4010,9 @@ async function redeem() {
     const boxes = res.data.mailboxes || [];
     boxes.forEach((m) => { m.code = code; });
     saveMailboxes(boxes);
-    setRedeemStatus(`兑换成功，已发放 ${boxes.length} 个邮箱（已存入本机「我的邮箱」）`, "ok");
+    setRedeemStatus(res.data.reused
+      ? `该卡密已兑换过，已为你找回 ${boxes.length} 个邮箱（已存入本机「我的邮箱」）`
+      : `兑换成功，已发放 ${boxes.length} 个邮箱（已存入本机「我的邮箱」）`, "ok");
     el("cdk-code").value = "";
     el("redeem-result").innerHTML = boxes.map((m) => `
       <article class="email-item">
@@ -4047,6 +4137,13 @@ renderMyMailboxes();
     .mailbox-tags { display:flex; gap:6px; flex-wrap:wrap; }
     .mailbox-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
     .mailbox-actions button { min-height:38px; padding:0 13px; font-size:14px; }
+    .mailbox-tools { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-top:10px; }
+    .mailbox-tools .check-all { display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--muted); cursor:pointer; user-select:none; }
+    .mailbox-tools input[type=checkbox], .mailbox-item input.mb-check { width:16px; height:16px; cursor:pointer; accent-color:var(--accent); }
+    .cred-row { display:flex; align-items:center; gap:9px; }
+    button.danger { background:#fff; color:#b43f2e; border-color:#f0c9c1; }
+    button.danger:hover { background:#fbeae6; border-color:#e1a99c; }
+    button.danger[disabled] { color:#b43f2e; }
     .modal { position:fixed; inset:0; background:rgba(15,23,42,.46); display:none; align-items:center; justify-content:center; padding:18px; z-index:60; backdrop-filter:blur(8px); }
     .modal.open { display:flex; }
     .modal-dialog { width:min(900px,100%); max-height:92vh; overflow:hidden; background:#fff; border:1px solid var(--line); border-radius:24px; box-shadow:0 28px 84px rgba(15,23,42,.22); }
@@ -4115,6 +4212,10 @@ renderMyMailboxes();
           </div>
           <p class="sub">点击邮箱卡片查看收件箱并复制地址；按钮可复制凭据 / API、重置密钥。</p>
           <input id="mailbox-search" placeholder="搜索邮箱地址 / 标签" style="width:100%; margin-top:12px;">
+          <div class="mailbox-tools">
+            <label class="check-all"><input id="mb-check-all" type="checkbox"> 全选</label>
+            <button id="btn-batch-delete" type="button" class="secondary danger" disabled>批量删除</button>
+          </div>
           <div id="mailbox-list" class="mailbox-list"></div>
           <div id="status" class="status"></div>
         </section>
@@ -4194,6 +4295,7 @@ function el(id) { return document.getElementById(id); }
 let cachedMailboxes = [];
 let selectedAddress = "";
 let currentInboxEmails = [];
+let selectedForDelete = new Set();
 
 function escapeHtml(value) {
   return String(value == null ? "" : value)
@@ -4319,12 +4421,16 @@ function renderMailboxItems(mailboxes) {
     item.className = "mailbox-item" + (address === selectedAddress ? " selected" : "");
     item.setAttribute("data-address", address);
     item.innerHTML = `
-      <div class="mono cred">${escapeHtml(address)}</div>
+      <div class="cred-row">
+        <input type="checkbox" class="mb-check" data-check="${escapeHtml(address)}"${selectedForDelete.has(address) ? " checked" : ""}>
+        <div class="mono cred">${escapeHtml(address)}</div>
+      </div>
       ${tags.length ? `<div class="mailbox-tags">${tags.map((t) => `<span class="pill">${escapeHtml(t)}</span>`).join("")}</div>` : ""}
       <div class="mailbox-actions">
         <button type="button" class="secondary" data-copy="${escapeHtml(credential)}">复制凭证</button>
         <button type="button" class="secondary" data-copy-api="${escapeHtml(apiCred)}">API接码</button>
         <button type="button" class="secondary" data-reset-key="${escapeHtml(address)}">重置密钥</button>
+        <button type="button" class="secondary danger" data-delete="${escapeHtml(address)}">删除</button>
       </div>`;
     list.appendChild(item);
   }
@@ -4339,7 +4445,19 @@ function filteredMailboxes() {
     return addr.includes(q) || tags.includes(q);
   });
 }
-function rerenderMailboxes() { renderMailboxItems(filteredMailboxes()); }
+function rerenderMailboxes() { renderMailboxItems(filteredMailboxes()); updateBatchBar(); }
+
+function updateBatchBar() {
+  const btn = el("btn-batch-delete");
+  const n = selectedForDelete.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `批量删除 (${n})` : "批量删除";
+  const visible = filteredMailboxes().map((m) => m.address);
+  const checkedVisible = visible.filter((a) => selectedForDelete.has(a)).length;
+  const all = el("mb-check-all");
+  all.checked = visible.length > 0 && checkedVisible === visible.length;
+  all.indeterminate = checkedVisible > 0 && checkedVisible < visible.length;
+}
 
 async function loadMailboxes() {
   const res = await api("/web/me/mailboxes");
@@ -4351,6 +4469,9 @@ async function loadMailboxes() {
     return [];
   }
   cachedMailboxes = res.data.mailboxes || [];
+  // 剪枝多选集:只保留仍存在的地址
+  const present = new Set(cachedMailboxes.map((m) => m.address));
+  selectedForDelete = new Set([...selectedForDelete].filter((a) => present.has(a)));
   // 选中态:保留当前选中,否则默认第一个
   const stillThere = cachedMailboxes.some((m) => m.address === selectedAddress);
   if (!stillThere) selectedAddress = cachedMailboxes.length ? cachedMailboxes[0].address : "";
@@ -4430,6 +4551,27 @@ async function selectMailbox(address) {
 el("mailbox-list").addEventListener("click", async (ev) => {
   const t = ev.target;
   if (!t || typeof t.getAttribute !== "function") return;
+  const checkAddr = t.getAttribute("data-check");
+  if (checkAddr !== null) {
+    if (t.checked) selectedForDelete.add(checkAddr);
+    else selectedForDelete.delete(checkAddr);
+    updateBatchBar();
+    return; // 不要触发卡片选中/复制
+  }
+  const delAddr = t.getAttribute("data-delete");
+  if (delAddr) {
+    if (!confirm(`确定从「我的邮箱」移除 ${delAddr}？（凭原兑换码仍可找回）`)) return;
+    setStatus("删除中...", "");
+    const res = await api("/web/me/mailboxes/delete", { method: "POST", body: JSON.stringify({ address: delAddr }) });
+    if (res.status === 200 && res.data.ok && res.data.deleted) {
+      selectedForDelete.delete(delAddr);
+      setStatus("已从我的邮箱移除", "ok");
+      await loadMailboxes();
+    } else {
+      setStatus(`删除失败: ${res.data.error || "操作失败"}`, "error");
+    }
+    return;
+  }
   const copyVal = t.getAttribute("data-copy");
   if (copyVal) {
     const ok = await copyText(copyVal);
@@ -4475,6 +4617,29 @@ el("inbox-list").addEventListener("click", (ev) => {
 
 el("mailbox-search").addEventListener("input", rerenderMailboxes);
 el("btn-refresh").onclick = async () => { await loadMailboxes(); };
+
+el("mb-check-all").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  for (const addr of filteredMailboxes().map((m) => m.address)) {
+    if (on) selectedForDelete.add(addr); else selectedForDelete.delete(addr);
+  }
+  rerenderMailboxes();
+});
+el("btn-batch-delete").onclick = async () => {
+  const addresses = [...selectedForDelete];
+  if (!addresses.length) return;
+  if (!confirm(`确定从「我的邮箱」移除选中的 ${addresses.length} 个邮箱？（凭原兑换码仍可找回）`)) return;
+  setStatus("批量删除中...", "");
+  const res = await api("/web/me/mailboxes/delete", { method: "POST", body: JSON.stringify({ addresses }) });
+  if (res.status === 200 && res.data.ok) {
+    selectedForDelete.clear();
+    const skipped = (res.data.skipped || []).length;
+    setStatus(`已移除 ${res.data.deleted} 个邮箱${skipped ? `，${skipped} 个跳过` : ""}`, "ok");
+    await loadMailboxes();
+  } else {
+    setStatus(`批量删除失败: ${res.data.error || "操作失败"}`, "error");
+  }
+};
 el("btn-inbox-refresh").onclick = async () => { if (selectedAddress) await loadInbox(selectedAddress); };
 el("closeModalButton").onclick = closeModal;
 el("viewRawButton").onclick = () => setModalView("raw");
@@ -4487,6 +4652,7 @@ function redeemErrMsg(code) {
     cdk_not_found: "卡密不存在", cdk_used: "卡密已被使用", cdk_expired: "卡密已过期",
     cdk_disabled: "卡密已被撤销", insufficient_stock: "库存不足，请联系卖家", missing_code: "请输入卡密",
     too_many_attempts: "操作过于频繁，请稍后再试", payload_too_large: "请求内容过大",
+    mailbox_unavailable: "该卡密绑定的邮箱已不可用，请联系卖家",
   };
   return map[code] || code || "操作失败";
 }
@@ -4499,7 +4665,9 @@ el("btn-redeem").onclick = async () => {
   const res = await api("/web/user/redeem", { method: "POST", body: JSON.stringify({ code }) });
   if (res.status === 200 && res.data.ok) {
     const boxes = res.data.mailboxes || [];
-    setRedeemStatus(`兑换成功，已发放 ${boxes.length} 个邮箱`, "ok");
+    setRedeemStatus(res.data.reused
+      ? `该卡密已兑换过，已为你找回 ${boxes.length} 个邮箱`
+      : `兑换成功，已发放 ${boxes.length} 个邮箱`, "ok");
     el("cdk-code").value = "";
     await loadMailboxes();
   } else {
@@ -4989,7 +5157,7 @@ boot();
         <section class="panel">
           <div class="panel-head">
             <h2 class="panel-title">生成 CDK 卡密</h2>
-            <span class="tag">单次兑换 · 按品类发货</span>
+            <span class="tag">一码一邮箱 · 可重复找回</span>
           </div>
           <div class="panel-body">
             <div class="form-grid">
@@ -5001,6 +5169,7 @@ boot();
               <label class="field">
                 <span class="field-label">每码发放邮箱数</span>
                 <input id="cdk-quantity" type="number" min="1" value="1">
+                <span class="muted" style="font-size:12px">该码兑换后永久绑定这些邮箱，重复兑换始终返回同一邮箱（供客户找回）</span>
               </label>
               <label class="field">
                 <span class="field-label">生成数量</span>
@@ -6909,6 +7078,31 @@ el("cdk-next-page").onclick = () => {
                     "credential": f"{record.address}----{record.access_key}",
                 },
             )
+            return
+        if parsed.path == "/web/me/mailboxes/delete":
+            session_user = self._require_session_user()
+            if not session_user:
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            addresses = payload.get("addresses")
+            if not isinstance(addresses, list):
+                addresses = [payload.get("address")]
+            addresses = [str(a) for a in addresses if a]
+            ok, result, reason = self.app.store.delete_user_mailboxes(
+                int(session_user["user_id"]), addresses
+            )
+            if not ok or result is None:
+                status_map = {
+                    "invalid_user": HTTPStatus.BAD_REQUEST,
+                    "missing_address": HTTPStatus.BAD_REQUEST,
+                }
+                self._send_json(status_map.get(reason, HTTPStatus.BAD_REQUEST), {"ok": False, "error": reason})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, **result})
             return
         if parsed.path == "/web/query-mails":
             try:

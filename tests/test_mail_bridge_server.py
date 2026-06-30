@@ -1529,18 +1529,106 @@ class MailBridgeServerTests(unittest.TestCase):
         self.assertEqual(after["available"], 0)
         self.assertEqual(after["sold"], 1)
 
-    def test_anonymous_redeem_double_spend_is_conflict(self) -> None:
+    def test_anonymous_redeem_again_returns_same_mailbox(self) -> None:
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])
         code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
 
-        self.assertEqual(self._redeem(code)[0], 200)
-        status, body = self._redeem(code)
-        self.assertEqual(status, 409)
-        self.assertEqual(body["error"], "cdk_used")
-        # Stock only moved by the one successful redemption.
+        status1, body1 = self._redeem(code)
+        self.assertEqual(status1, 200, body1)
+        self.assertFalse(body1.get("reused"))
+        addr1 = body1["mailboxes"][0]["address"]
+
+        # Re-redeeming the same code returns the SAME mailbox — recovery for a
+        # buyer who cleared their cache — never a second account, never extra stock.
+        status2, body2 = self._redeem(code)
+        self.assertEqual(status2, 200, body2)
+        self.assertTrue(body2.get("reused"))
+        self.assertEqual(body2["mailboxes"][0]["address"], addr1)
+        # Stock only moved by the one real dispense.
         self.assertEqual(self._tag_stock(self._stock(cookie), tag_id)["sold"], 1)
+
+    def test_reredeem_claims_anonymous_mailbox_into_account(self) -> None:
+        cookie = self._admin_cookie()
+        tag_id = self._create_tag("outlook", cookie)
+        self._bulk_import("a@x.com", cookie, tag_ids=[tag_id])
+        code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+
+        # First redeemed anonymously (not bound to any account).
+        status, body = self._redeem(code)
+        self.assertEqual(status, 200, body)
+        address = body["mailboxes"][0]["address"]
+
+        # A buyer who cleared their cache signs up and re-redeems the SAME code:
+        # same mailbox, now claimed into their account.
+        self.assertEqual(self._web_register("buyer", USER_PASSWORD)[0], 200)
+        _, _, user_cookie = self._web_login("buyer", USER_PASSWORD)
+        status, body = self._redeem(code, cookie=user_cookie)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("reused"))
+        self.assertEqual(body["mailboxes"][0]["address"], address)
+
+        status, mine = self._request("GET", "/web/me/mailboxes", include_auth=False, cookie=user_cookie)
+        self.assertEqual(status, 200, mine)
+        self.assertIn(address, [m["address"] for m in mine["mailboxes"]])
+
+    def test_user_delete_mailbox_unlinks_and_is_recoverable(self) -> None:
+        cookie = self._admin_cookie()
+        tag_id = self._create_tag("outlook", cookie)
+        self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])
+        code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+
+        self.assertEqual(self._web_register("buyer", USER_PASSWORD)[0], 200)
+        _, _, user_cookie = self._web_login("buyer", USER_PASSWORD)
+
+        status, body = self._redeem(code, cookie=user_cookie)
+        self.assertEqual(status, 200, body)
+        address = body["mailboxes"][0]["address"]
+        _, mine = self._request("GET", "/web/me/mailboxes", include_auth=False, cookie=user_cookie)
+        self.assertIn(address, [m["address"] for m in mine["mailboxes"]])
+
+        # Delete = unlink from my list.
+        status, body = self._request(
+            "POST", "/web/me/mailboxes/delete", payload={"address": address}, include_auth=False, cookie=user_cookie
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["deleted"], 1)
+        _, mine = self._request("GET", "/web/me/mailboxes", include_auth=False, cookie=user_cookie)
+        self.assertNotIn(address, [m["address"] for m in mine["mailboxes"]])
+
+        # Recoverable: re-redeeming the same code re-claims the same mailbox.
+        status, body = self._redeem(code, cookie=user_cookie)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body.get("reused"))
+        self.assertEqual(body["mailboxes"][0]["address"], address)
+        _, mine = self._request("GET", "/web/me/mailboxes", include_auth=False, cookie=user_cookie)
+        self.assertIn(address, [m["address"] for m in mine["mailboxes"]])
+
+    def test_user_delete_skips_mailbox_not_owned(self) -> None:
+        cookie = self._admin_cookie()
+        tag_id = self._create_tag("outlook", cookie)
+        self._bulk_import("a@x.com\nb@x.com", cookie, tag_ids=[tag_id])
+        code_a = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+        code_b = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
+
+        self.assertEqual(self._web_register("buyer1", USER_PASSWORD)[0], 200)
+        _, _, c1 = self._web_login("buyer1", USER_PASSWORD)
+        addr1 = self._redeem(code_a, cookie=c1)[1]["mailboxes"][0]["address"]
+
+        self.assertEqual(self._web_register("buyer2", USER_PASSWORD)[0], 200)
+        _, _, c2 = self._web_login("buyer2", USER_PASSWORD)
+        self._redeem(code_b, cookie=c2)
+
+        # buyer2 cannot delete buyer1's mailbox — it is skipped, not removed.
+        status, body = self._request(
+            "POST", "/web/me/mailboxes/delete", payload={"addresses": [addr1]}, include_auth=False, cookie=c2
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["deleted"], 0)
+        self.assertIn(addr1, body["skipped"])
+        _, mine = self._request("GET", "/web/me/mailboxes", include_auth=False, cookie=c1)
+        self.assertIn(addr1, [m["address"] for m in mine["mailboxes"]])
 
     def test_insufficient_stock_preserves_inventory(self) -> None:
         cookie = self._admin_cookie()
@@ -1625,13 +1713,13 @@ class MailBridgeServerTests(unittest.TestCase):
         self.assertEqual(status, 200, mails)
         self.assertGreaterEqual(mails["total"], 1)
 
-    def test_concurrent_redeem_on_single_stock_yields_exactly_one_winner(self) -> None:
+    def test_concurrent_redeem_same_code_yields_same_single_mailbox(self) -> None:
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
         self._bulk_import("only@x.com", cookie, tag_ids=[tag_id])  # exactly 1 in stock
-        # Over-issuing CDKs beyond stock is now impossible (gen reserves presale),
-        # so the live race is two concurrent redemptions of the *same* single-use
-        # code: exactly one wins, the other is rejected as already used.
+        # A code is permanently bound to its mailbox: two concurrent redemptions
+        # of the same code both succeed and both return that one mailbox — never
+        # two different accounts, never more than one stock item consumed.
         code = self._gen_cdk(cookie, tag_id=tag_id, quantity=1)[0]["code"]
 
         barrier = threading.Barrier(2)
@@ -1642,7 +1730,7 @@ class MailBridgeServerTests(unittest.TestCase):
             barrier.wait()
             status, body = self._redeem(code)
             with lock:
-                results.append((status, body.get("error")))
+                results.append((status, body))
 
         threads = [threading.Thread(target=worker) for _ in range(2)]
         for t in threads:
@@ -1650,11 +1738,9 @@ class MailBridgeServerTests(unittest.TestCase):
         for t in threads:
             t.join(timeout=10)
 
-        wins = [r for r in results if r[0] == 200]
-        losses = [r for r in results if r[0] == 409]
-        self.assertEqual(len(wins), 1, results)
-        self.assertEqual(len(losses), 1, results)
-        self.assertEqual(losses[0][1], "cdk_used")
+        self.assertTrue(all(r[0] == 200 for r in results), results)
+        addrs = {r[1]["mailboxes"][0]["address"] for r in results}
+        self.assertEqual(addrs, {"only@x.com"})
         final = self._tag_stock(self._stock(cookie), tag_id)
         self.assertEqual(final["available"], 0)
         self.assertEqual(final["sold"], 1)
