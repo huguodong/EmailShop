@@ -4058,6 +4058,10 @@ renderMyMailboxes();
     .email-meta-modal { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px 18px; color:#344054; }
     .email-meta-modal p { margin:0; line-height:1.7; min-width:0; overflow-wrap:anywhere; }
     .modal-content-switch { display:flex; gap:10px; flex-wrap:wrap; margin-top:14px; }
+    .bulk-line { padding:7px 2px; font-size:13px; border-bottom:1px dashed var(--line); word-break:break-all; }
+    .bulk-line:last-child { border-bottom:none; }
+    .bulk-line.ok { color:#0d7a56; }
+    .bulk-line.err { color:#b43f2e; }
     .modal-switch { background:var(--accent-soft); color:var(--accent); border-color:#d4e2ff; }
     .modal-switch.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     iframe { width:100%; min-height:50vh; border:1px solid var(--line); border-radius:16px; background:#fff; }
@@ -4098,6 +4102,7 @@ renderMyMailboxes();
         <div class="row" style="margin-top:14px">
           <input id="cdk-code" class="mono" placeholder="CDK-XXXXX-XXXXX-XXXXX-XXXXX">
           <button id="btn-redeem">兑换</button>
+          <button id="btn-bulk-redeem" class="ghost">批量兑换</button>
         </div>
         <div id="redeem-status" class="status"></div>
       </section>
@@ -4151,6 +4156,28 @@ renderMyMailboxes();
             <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
             <pre id="emailBodyFallback" class="modal-fallback"></pre>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="bulkModal" class="modal">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div>
+            <h2 class="modal-title">批量兑换 CDK</h2>
+            <div class="modal-header-copy">每行输入一个兑换码，点击「兑换」依次兑换，邮箱自动进入「我的邮箱」</div>
+          </div>
+          <button type="button" class="secondary" id="bulkCloseButton" aria-label="关闭">关闭</button>
+        </div>
+        <div class="modal-body">
+          <textarea id="bulk-codes" rows="8" placeholder="每行一个兑换码，例如：&#10;CDK-ABCDE-FGHJK-LMNPQ-RSTUV&#10;CDK-VWXYZ-12345-67890-ABCDE" style="width:100%; resize:vertical; min-height:160px; border:1px solid var(--line); border-radius:14px; padding:12px 14px; font:inherit; box-sizing:border-box;"></textarea>
+          <div style="display:flex; gap:12px; align-items:center; margin-top:12px;">
+            <button id="btn-bulk-submit" type="button">兑换</button>
+            <div id="bulk-status" class="status" style="margin:0"></div>
+          </div>
+          <div id="bulk-result" style="margin-top:14px"></div>
         </div>
       </div>
     </div>
@@ -4455,6 +4482,14 @@ el("viewRenderedButton").onclick = () => setModalView("rendered");
 el("emailModal").addEventListener("click", (ev) => { if (ev.target === el("emailModal")) closeModal(); });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeModal(); });
 
+function redeemErrMsg(code) {
+  const map = {
+    cdk_not_found: "卡密不存在", cdk_used: "卡密已被使用", cdk_expired: "卡密已过期",
+    cdk_disabled: "卡密已被撤销", insufficient_stock: "库存不足，请联系卖家", missing_code: "请输入卡密",
+    too_many_attempts: "操作过于频繁，请稍后再试", payload_too_large: "请求内容过大",
+  };
+  return map[code] || code || "操作失败";
+}
 el("btn-redeem").onclick = async () => {
   const code = el("cdk-code").value.trim();
   if (!code) { setRedeemStatus("请输入卡密", "error"); return; }
@@ -4468,14 +4503,42 @@ el("btn-redeem").onclick = async () => {
     el("cdk-code").value = "";
     await loadMailboxes();
   } else {
-    const map = {
-      cdk_not_found: "卡密不存在", cdk_used: "卡密已被使用", cdk_expired: "卡密已过期",
-      cdk_disabled: "卡密已被撤销", insufficient_stock: "库存不足，请联系卖家", missing_code: "请输入卡密",
-      too_many_attempts: "操作过于频繁，请稍后再试", payload_too_large: "请求内容过大",
-    };
-    setRedeemStatus(`兑换失败: ${map[res.data.error] || res.data.error || "操作失败"}`, "error");
+    setRedeemStatus(`兑换失败: ${redeemErrMsg(res.data.error)}`, "error");
   }
   button.disabled = false;
+};
+
+// ---- 批量兑换 ----
+function setBulkStatus(text, kind = "") { const n = el("bulk-status"); n.textContent = text; n.className = "status" + (kind ? ` ${kind}` : ""); }
+function openBulkModal() { setBulkStatus(""); el("bulk-result").innerHTML = ""; el("bulkModal").classList.add("open"); el("bulk-codes").focus(); }
+function closeBulkModal() { el("bulkModal").classList.remove("open"); }
+el("btn-bulk-redeem").onclick = openBulkModal;
+el("bulkCloseButton").onclick = closeBulkModal;
+el("bulkModal").addEventListener("click", (ev) => { if (ev.target === el("bulkModal")) closeBulkModal(); });
+el("btn-bulk-submit").onclick = async () => {
+  const codes = [...new Set((el("bulk-codes").value || "").split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean))];
+  if (!codes.length) { setBulkStatus("请每行输入一个兑换码", "error"); return; }
+  const submit = el("btn-bulk-submit");
+  submit.disabled = true;
+  const lines = [];
+  let okCount = 0, failCount = 0, boxCount = 0;
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    setBulkStatus(`兑换中... (${i + 1}/${codes.length})`);
+    const res = await api("/web/user/redeem", { method: "POST", body: JSON.stringify({ code }) });
+    if (res.status === 200 && res.data.ok) {
+      const boxes = res.data.mailboxes || [];
+      boxCount += boxes.length; okCount++;
+      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxes.map((b) => escapeHtml(b.address)).join("、") || "已发放"}</div>`);
+    } else {
+      failCount++;
+      lines.push(`<div class="bulk-line err">❌ ${escapeHtml(code)} → ${escapeHtml(redeemErrMsg(res.data.error))}</div>`);
+    }
+    el("bulk-result").innerHTML = lines.join("");
+  }
+  if (boxCount) await loadMailboxes();
+  setBulkStatus(`完成：成功 ${okCount} 张，失败 ${failCount} 张，共发放 ${boxCount} 个邮箱`, failCount ? "error" : "ok");
+  submit.disabled = false;
 };
 
 el("btn-change-pass").onclick = async () => {
