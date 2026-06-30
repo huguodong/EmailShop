@@ -3455,6 +3455,10 @@ el("login-form").onsubmit = async (ev) => {
     .mailbox-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px; border:1px solid var(--line); border-radius:14px; background:linear-gradient(180deg,#fff 0%,#fbfcff 100%); }
     .mailbox-row .addr { font-weight:600; color:#1f2937; word-break:break-all; flex:1; min-width:160px; }
     .mailbox-row button { min-height:38px; padding:8px 14px; }
+    .bulk-line { padding:7px 2px; font-size:13px; border-bottom:1px dashed var(--line); word-break:break-all; }
+    .bulk-line:last-child { border-bottom:none; }
+    .bulk-line.ok { color:#0d7a56; }
+    .bulk-line.err { color:#b43f2e; }
   </style>
 </head>
 <body>
@@ -3486,6 +3490,7 @@ el("login-form").onsubmit = async (ev) => {
             <span class="search-icon">🎁</span>
             <input id="cdk-code" autocomplete="off" placeholder="请输入卡密，例如 CDK-ABCDE-FGHJK-LMNPQ-RSTUV">
             <button id="btn-redeem" class="button-primary" type="button">立即兑换</button>
+            <button id="btn-bulk-redeem" class="button-ghost" type="button">批量兑换</button>
           </div>
           <div class="admin-entry" style="margin-top:12px">卡网地址：<a href="https://pay.ldxp.cn/shop/GIVMA9MV" target="_blank" rel="noopener noreferrer">https://pay.ldxp.cn/shop/GIVMA9MV</a></div>
           <div id="redeem-status" class="message-area"></div>
@@ -3563,6 +3568,28 @@ el("login-form").onsubmit = async (ev) => {
             <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
             <pre id="emailBodyFallback" class="modal-fallback"></pre>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="bulkModal" class="modal">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <div>
+            <h2 class="modal-title">批量兑换 CDK</h2>
+            <div class="modal-header-copy">每行输入一个兑换码，点击「兑换」依次兑换，凭据自动保存到本机</div>
+          </div>
+          <button type="button" class="close-button" id="bulkCloseButton" aria-label="关闭">×</button>
+        </div>
+        <div class="modal-body">
+          <textarea id="bulk-codes" rows="8" placeholder="每行一个兑换码，例如：&#10;CDK-ABCDE-FGHJK-LMNPQ-RSTUV&#10;CDK-VWXYZ-12345-67890-ABCDE" style="width:100%; resize:vertical; min-height:160px; border:1px solid #d0d8ed; border-radius:14px; padding:12px 14px; font:inherit; box-sizing:border-box;"></textarea>
+          <div style="display:flex; gap:12px; align-items:center; margin-top:12px;">
+            <button id="btn-bulk-submit" class="button-primary" type="button">兑换</button>
+            <div id="bulk-status" class="message-area" style="margin:0"></div>
+          </div>
+          <div id="bulk-result" style="margin-top:14px"></div>
         </div>
       </div>
     </div>
@@ -3916,6 +3943,40 @@ async function redeem() {
 }
 el("btn-redeem").onclick = redeem;
 el("cdk-code").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); redeem(); } });
+
+// ---- 批量兑换 ----
+function setBulkStatus(text, kind = "") { const n = el("bulk-status"); n.textContent = text; n.className = "message-area" + (kind ? ` ${kind}` : ""); }
+function openBulkModal() { setBulkStatus(""); el("bulk-result").innerHTML = ""; el("bulkModal").classList.add("open"); el("bulk-codes").focus(); }
+function closeBulkModal() { el("bulkModal").classList.remove("open"); }
+el("btn-bulk-redeem").onclick = openBulkModal;
+el("bulkCloseButton").onclick = closeBulkModal;
+el("bulkModal").addEventListener("click", (ev) => { if (ev.target === el("bulkModal")) closeBulkModal(); });
+el("btn-bulk-submit").onclick = async () => {
+  const codes = [...new Set((el("bulk-codes").value || "").split(/\\r?\\n/).map((s) => s.trim()).filter(Boolean))];
+  if (!codes.length) { setBulkStatus("请每行输入一个兑换码", "error"); return; }
+  const submit = el("btn-bulk-submit");
+  submit.disabled = true;
+  const allBoxes = [], lines = [];
+  let okCount = 0, failCount = 0;
+  for (let i = 0; i < codes.length; i++) {
+    const code = codes[i];
+    setBulkStatus(`兑换中... (${i + 1}/${codes.length})`);
+    const res = await api("/web/user/redeem", { method: "POST", body: JSON.stringify({ code }) });
+    if (res.status === 200 && res.data.ok) {
+      const boxes = (res.data.mailboxes || []).map((m) => ({ ...m, code }));
+      allBoxes.push(...boxes);
+      okCount++;
+      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxes.map((b) => escapeHtml(b.address)).join("、") || "已发放"}</div>`);
+    } else {
+      failCount++;
+      lines.push(`<div class="bulk-line err">❌ ${escapeHtml(code)} → ${escapeHtml(getRedeemErrorMessage(res.data.error))}</div>`);
+    }
+    el("bulk-result").innerHTML = lines.join("");
+  }
+  if (allBoxes.length) saveMailboxes(allBoxes);
+  setBulkStatus(`完成：成功 ${okCount} 张，失败 ${failCount} 张，共发放 ${allBoxes.length} 个邮箱（已存入本机「我的邮箱」）`, failCount ? "error" : "ok");
+  submit.disabled = false;
+};
 el("redeem-result").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button");
   if (!btn) return;
