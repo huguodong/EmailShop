@@ -2071,6 +2071,55 @@ class MailBridgeStore:
             return False, "cdk_not_found"
         return True, "ok"
 
+    def get_cdk_bound_mailboxes(self, cdk_id: int) -> tuple[bool, Optional[dict[str, Any]], str]:
+        clean_id = int(cdk_id or 0)
+        if clean_id <= 0:
+            return False, None, "invalid_cdk_id"
+        with self._lock:
+            cdk = self._conn.execute(
+                "SELECT * FROM cdks WHERE id = ? LIMIT 1", (clean_id,)
+            ).fetchone()
+            if not cdk:
+                return False, None, "cdk_not_found"
+            redemption = self._conn.execute(
+                "SELECT * FROM cdk_redemptions WHERE cdk_id = ? AND status = 'success' ORDER BY id ASC LIMIT 1",
+                (clean_id,),
+            ).fetchone()
+            addresses = [a for a in json.loads(redemption["addresses"] or "[]") if a] if redemption else []
+            rows = []
+            if addresses:
+                placeholders = ",".join("?" for _ in addresses)
+                rows = self._conn.execute(
+                    f"""
+                    SELECT id, address, access_key, status, active, owner_user_id, sold_at
+                    FROM mailbox_credentials
+                    WHERE address IN ({placeholders})
+                    ORDER BY id ASC
+                    """,
+                    tuple(addresses),
+                ).fetchall()
+        mailboxes = [
+            {
+                "id": int(r["id"] or 0),
+                "address": str(r["address"] or ""),
+                "access_key": str(r["access_key"] or ""),
+                "credential": f"{r['address']}----{r['access_key']}",
+                "status": str(r["status"] or ""),
+                "active": int(r["active"] or 0),
+                "owner_user_id": int(r["owner_user_id"] or 0),
+                "sold_at": str(r["sold_at"] or ""),
+            }
+            for r in rows
+        ]
+        data = {
+            "code": str(cdk["code"] or ""),
+            "redeemed": bool(redemption),
+            "user_id": int(redemption["user_id"] or 0) if redemption else 0,
+            "redeemed_at": str(redemption["redeemed_at"] or "") if redemption else "",
+            "mailboxes": mailboxes,
+        }
+        return True, data, "ok"
+
     def stock_summary_by_tag(self) -> dict[str, Any]:
         with self._lock:
             tag_rows = self._conn.execute(
@@ -6310,6 +6359,7 @@ async function refreshCdks(resetOffset) {
         </div>
         <div style="margin-top:6px; display:flex; gap:8px">
           <button class="ghost" data-cdk-copy="${escapeHtml(c.code)}">复制</button>
+          <button class="ghost" data-cdk-view-mailboxes="${c.id}">查看邮箱</button>
           ${c.active ? `<button class="secondary" data-cdk-revoke="${c.id}">撤销</button>` : ""}
         </div>
       </div>
@@ -6360,6 +6410,21 @@ el("cdk-list").addEventListener("click", async (ev) => {
   if (!target || typeof target.getAttribute !== "function") return;
   const copyCode = target.getAttribute("data-cdk-copy");
   if (copyCode) { await copyText(copyCode); setCdkStatus("已复制卡密", "ok"); return; }
+  const viewMailboxesId = target.getAttribute("data-cdk-view-mailboxes");
+  if (viewMailboxesId) {
+    const res = await api(`/web/admin/cdks/${viewMailboxesId}/mailboxes`);
+    if (!(res.status === 200 && res.data.ok)) {
+      setCdkStatus(`查询失败: ${res.data.error || "操作失败"}`, "error");
+      return;
+    }
+    setResult(res.data);
+    const boxes = res.data.mailboxes || [];
+    setCdkStatus(
+      res.data.redeemed ? `该卡密已绑定 ${boxes.length} 个邮箱，详情见下方结果面板` : "该卡密尚未被兑换，暂无绑定邮箱",
+      res.data.redeemed ? "ok" : ""
+    );
+    return;
+  }
   const revokeId = target.getAttribute("data-cdk-revoke");
   if (revokeId) {
     if (!confirm("确定撤销该卡密？撤销后无法兑换。")) return;
@@ -6650,6 +6715,22 @@ el("cdk-next-page").onclick = () => {
                 HTTPStatus.OK,
                 {"ok": True, "cdks": items, "total": total, "limit": limit, "offset": offset},
             )
+            return
+        if parsed.path.startswith("/web/admin/cdks/") and parsed.path.endswith("/mailboxes"):
+            session_user = self._require_admin_session_user()
+            if not session_user:
+                return
+            middle = parsed.path[len("/web/admin/cdks/") : -len("/mailboxes")]
+            cdk_id = self._parse_int(middle, default=0, minimum=0, maximum=10_000_000)
+            if cdk_id <= 0:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_cdk_id"})
+                return
+            ok, data, reason = self.app.store.get_cdk_bound_mailboxes(cdk_id)
+            if not ok:
+                status = HTTPStatus.NOT_FOUND if reason == "cdk_not_found" else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True, **(data or {})})
             return
         if parsed.path == "/web/admin/stock":
             session_user = self._require_admin_session_user()
