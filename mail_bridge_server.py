@@ -734,6 +734,19 @@ class MailBridgeStore:
                     "UPDATE mailbox_credentials SET access_key=? WHERE id=?",
                     (generate_access_key(), mid),
                 )
+            # Pinned-mailbox columns (added for per-mailbox CDK reservation).
+            if "pinned_cdk_id" not in mailbox_columns:
+                self._conn.execute(
+                    "ALTER TABLE mailbox_credentials ADD COLUMN pinned_cdk_id INTEGER NOT NULL DEFAULT 0"
+                )
+            cdk_columns = {
+                str(row["name"] or "")
+                for row in self._conn.execute("PRAGMA table_info(cdks)").fetchall()
+            }
+            if "pinned_mailbox_ids" not in cdk_columns:
+                self._conn.execute(
+                    "ALTER TABLE cdks ADD COLUMN pinned_mailbox_ids TEXT NOT NULL DEFAULT ''"
+                )
             self._conn.commit()
 
     def save_message(self, payload: Dict[str, Any]) -> MailRecord:
@@ -1670,7 +1683,64 @@ class MailBridgeStore:
         note: str = "",
         expires_at: str = "",
         created_by: int = 0,
+        pinned_addresses: list = [],
     ) -> dict[str, Any]:
+        # Pinned mode: one CDK per specified address, ignoring count/tag/quantity.
+        clean_pinned = [str(a).strip() for a in (pinned_addresses or []) if str(a).strip()]
+        if clean_pinned:
+            now = utcnow_iso()
+            clean_label = str(batch_label or "").strip()
+            clean_note = str(note or "").strip()
+            clean_expires = str(expires_at or "").strip()
+            created: list[dict[str, Any]] = []
+            with self._lock:
+                for address in clean_pinned:
+                    row = self._conn.execute(
+                        "SELECT id, status FROM mailbox_credentials WHERE address = ? AND active = 1 LIMIT 1",
+                        (address,),
+                    ).fetchone()
+                    if not row or str(row["status"] or "") == "sold":
+                        continue
+                    mailbox_id = int(row["id"])
+                    code = ""
+                    for _attempt in range(10):
+                        candidate = generate_cdk_code()
+                        if not self._conn.execute(
+                            "SELECT 1 FROM cdks WHERE code = ? LIMIT 1", (candidate,)
+                        ).fetchone():
+                            code = candidate
+                            break
+                    if not code:
+                        continue
+                    cursor = self._conn.execute(
+                        """
+                        INSERT INTO cdks
+                            (code, tag_id, quantity, max_uses, used_count, active,
+                             batch_label, note, expires_at, created_by, created_at, pinned_mailbox_ids)
+                        VALUES (?, 0, 1, 1, 0, 1, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (code, clean_label, clean_note, clean_expires,
+                         int(created_by or 0), now, json.dumps([mailbox_id])),
+                    )
+                    cdk_id = int(cursor.lastrowid or 0)
+                    # Mark mailbox as available and reserved for this CDK.
+                    self._conn.execute(
+                        "UPDATE mailbox_credentials SET status = 'available', pinned_cdk_id = ?, updated_at = ? WHERE id = ?",
+                        (cdk_id, now, mailbox_id),
+                    )
+                    created.append({
+                        "id": cdk_id,
+                        "code": code,
+                        "tag_id": 0,
+                        "quantity": 1,
+                        "max_uses": 1,
+                        "batch_label": clean_label,
+                        "expires_at": clean_expires,
+                        "pinned_address": address,
+                    })
+                self._conn.commit()
+            return {"ok": True, "codes": created, "moved": 0}
+
         clean_count = max(1, min(int(count or 0), 1000))
         clean_tag_id = max(0, int(tag_id or 0))
         clean_quantity = max(1, int(quantity or 1))
@@ -1869,12 +1939,21 @@ class MailBridgeStore:
             if expires_at and expires_at <= now:
                 return False, None, "cdk_expired"
 
-            if tag_id > 0:
+            pinned_ids = json.loads(cdk["pinned_mailbox_ids"] or "[]") if cdk["pinned_mailbox_ids"] else []
+            if pinned_ids:
+                ph = ",".join("?" for _ in pinned_ids)
+                rows = self._conn.execute(
+                    f"SELECT id, address FROM mailbox_credentials "
+                    f"WHERE id IN ({ph}) AND status = 'available' AND pinned_cdk_id = ?",
+                    (*pinned_ids, cdk_id),
+                ).fetchall()
+            elif tag_id > 0:
                 rows = self._conn.execute(
                     """
                     SELECT mc.id AS id, mc.address AS address
                     FROM mailbox_credentials mc
                     WHERE mc.status = 'available' AND mc.active = 1
+                      AND (mc.pinned_cdk_id IS NULL OR mc.pinned_cdk_id = 0)
                       AND EXISTS (
                           SELECT 1 FROM mailbox_tag_links l
                           WHERE l.mailbox_id = mc.id AND l.tag_id = ?
@@ -1890,6 +1969,7 @@ class MailBridgeStore:
                     SELECT mc.id AS id, mc.address AS address
                     FROM mailbox_credentials mc
                     WHERE mc.status = 'available' AND mc.active = 1
+                      AND (mc.pinned_cdk_id IS NULL OR mc.pinned_cdk_id = 0)
                     ORDER BY mc.id ASC
                     LIMIT ?
                     """,
@@ -5124,6 +5204,12 @@ boot();
             <span id="mailboxes-summary" class="muted">加载中...</span>
             <span id="mailboxes-page-info" class="tag">第 1 页</span>
           </div>
+          <div class="toolbar-row" id="mailbox-batch-bar" style="display:none;gap:10px;flex-wrap:wrap;align-items:center">
+            <span id="mb-admin-selected-label" class="muted">已选 0 个</span>
+            <input id="mb-cdk-batch-label" placeholder="批次标签（可选）" style="width:160px">
+            <button id="btn-gen-cdk-from-mb" class="secondary">生成专属卡密</button>
+            <span id="mb-gen-cdk-status" class="muted" style="font-size:12px"></span>
+          </div>
           <div id="status" class="status-bar"></div>
         </section>
 
@@ -5137,7 +5223,7 @@ boot();
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>邮箱</th><th>备注</th><th>标签</th><th>状态</th><th>创建时间</th><th>邮件数</th><th>操作</th></tr>
+                <tr><th style="width:32px"><input id="mb-admin-check-all" type="checkbox" title="全选当前页"></th><th>ID</th><th>邮箱</th><th>备注</th><th>标签</th><th>状态</th><th>创建时间</th><th>邮件数</th><th>操作</th></tr>
               </thead>
               <tbody id="mailboxes-body"></tbody>
             </table>
@@ -5292,6 +5378,11 @@ boot();
               <label class="field">
                 <span class="field-label">备注（可选）</span>
                 <input id="cdk-note" placeholder="可选">
+              </label>
+              <label class="field" style="grid-column:1/-1">
+                <span class="field-label">指定邮箱（可选，每行一个地址）</span>
+                <textarea id="cdk-pinned" rows="4" placeholder="留空则从库存自动发货&#10;填写邮箱地址后，为每个地址单独生成一个专属卡密（上方「生成数量」自动忽略）" style="width:100%;font-size:12px;font-family:monospace;resize:vertical"></textarea>
+                <span class="muted" style="font-size:12px">每行一个邮箱地址；该邮箱会被预留，仅凭此卡密才能兑换</span>
               </label>
               <button id="btn-gen-cdk" class="button-block">生成卡密并复制</button>
             </div>
@@ -5479,6 +5570,7 @@ function setResult(v) {
 }
 let mailboxesCache = [];
 let mailboxPagination = { keyword: "", limit: 20, offset: 0, total: 0 };
+let selectedAdminMailboxes = new Set();
 let tagFilterValue = "";
 let statusFilterValue = "";
 let tagCache = [];
@@ -5692,12 +5784,13 @@ function renderMailboxesTable() {
   tbody.innerHTML = "";
   if (!mailboxesCache.length) {
     const tr = document.createElement("tr");
-    tr.innerHTML = '<td colspan="8" class="empty-state">当前页没有邮箱记录</td>';
+    tr.innerHTML = '<td colspan="9" class="empty-state">当前页没有邮箱记录</td>';
     tbody.appendChild(tr);
   }
   for (const m of mailboxesCache) {
     const tr = document.createElement("tr");
     const addressText = String(m.address || "").trim();
+    const isChecked = selectedAdminMailboxes.has(addressText);
     const noteText = String(m.note || "").trim();
     const poolMap = { presale: ["预售池", "warn"], available: ["可兑换", "active"], sold: ["已售出", "inactive"], deleted: ["已删除", "inactive"] };
     const curStatus = poolMap[m.status] ? m.status : "available";
@@ -5715,7 +5808,7 @@ function renderMailboxesTable() {
     const tagsDisplay = tags.length
       ? `<div class="tag-list">${tags.map((tag) => `<span class="tag-chip">${escapeHtml(tag.name || "")}</span>`).join("")}</div>`
       : "-";
-    tr.innerHTML = `<td>${m.id}</td><td>${addressDisplay}</td><td>${noteDisplay}</td><td>${tagsDisplay}</td><td>${statusCell}</td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
+    tr.innerHTML = `<td><input type="checkbox" class="mb-admin-check" data-address="${escapeHtml(addressText)}"${isChecked ? " checked" : ""}></td><td>${m.id}</td><td>${addressDisplay}</td><td>${noteDisplay}</td><td>${tagsDisplay}</td><td>${statusCell}</td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
       <td>
         <div class="table-actions">
           <button data-a="copy" data-id="${m.id}" class="icon-btn ghost" title="复制凭据" aria-label="复制凭据">⧉</button>
@@ -5939,6 +6032,59 @@ el("btn-prev-page").onclick = async () => {
 el("btn-next-page").onclick = async () => {
   mailboxPagination.offset += mailboxPagination.limit;
   await refreshMailboxes(false);
+};
+
+function updateAdminMailboxBatchBar() {
+  const n = selectedAdminMailboxes.size;
+  el("mailbox-batch-bar").style.display = n ? "" : "none";
+  el("mb-admin-selected-label").textContent = `已选 ${n} 个`;
+  const all = el("mb-admin-check-all");
+  if (!all) return;
+  const visible = mailboxesCache.map(m => m.address);
+  const checkedVisible = visible.filter(a => selectedAdminMailboxes.has(a)).length;
+  all.checked = visible.length > 0 && checkedVisible === visible.length;
+  all.indeterminate = checkedVisible > 0 && checkedVisible < visible.length;
+}
+el("mailboxes-body").addEventListener("change", (ev) => {
+  const cb = ev.target.closest(".mb-admin-check");
+  if (!cb) return;
+  const addr = cb.getAttribute("data-address");
+  if (!addr) return;
+  if (cb.checked) selectedAdminMailboxes.add(addr); else selectedAdminMailboxes.delete(addr);
+  updateAdminMailboxBatchBar();
+});
+el("mb-admin-check-all").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  for (const m of mailboxesCache) {
+    if (on) selectedAdminMailboxes.add(m.address); else selectedAdminMailboxes.delete(m.address);
+  }
+  renderMailboxesTable();
+  updateAdminMailboxBatchBar();
+});
+el("btn-gen-cdk-from-mb").onclick = async () => {
+  const addresses = [...selectedAdminMailboxes];
+  if (!addresses.length) return;
+  const btn = el("btn-gen-cdk-from-mb");
+  const statusEl = el("mb-gen-cdk-status");
+  btn.disabled = true;
+  statusEl.textContent = "生成中...";
+  const batchLabel = el("mb-cdk-batch-label").value.trim();
+  const res = await api("/web/admin/cdks", {
+    method: "POST",
+    body: JSON.stringify({ count: 1, pinned_addresses: addresses, batch_label: batchLabel }),
+  });
+  btn.disabled = false;
+  if (!(res.status === 200 && res.data.ok)) {
+    statusEl.textContent = `失败: ${res.data.error || "操作失败"}`;
+    return;
+  }
+  const codes = (res.data.codes || []).map(c => c.code);
+  await copyText(codes.join("\n"));
+  statusEl.textContent = `已生成并复制 ${codes.length} 个卡密`;
+  selectedAdminMailboxes.clear();
+  renderMailboxesTable();
+  updateAdminMailboxBatchBar();
+  if (typeof refreshCdks === "function") refreshCdks(true);
 };
 
 el("btn-logout").onclick = async () => {
@@ -6481,10 +6627,12 @@ el("btn-gen-cdk").onclick = async () => {
   const note = el("cdk-note").value.trim();
   let expires = el("cdk-expires").value.trim();
   if (expires) { try { expires = new Date(expires).toISOString(); } catch { expires = ""; } }
+  const pinnedRaw = el("cdk-pinned") ? el("cdk-pinned").value.trim() : "";
+  const pinnedAddresses = pinnedRaw ? pinnedRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean) : [];
   setCdkStatus("生成中...", "");
   const res = await api("/web/admin/cdks", {
     method: "POST",
-    body: JSON.stringify({ count, tag_id: tagId, quantity, batch_label: batch, note, expires_at: expires }),
+    body: JSON.stringify({ count, tag_id: tagId, quantity, batch_label: batch, note, expires_at: expires, pinned_addresses: pinnedAddresses }),
   });
   if (!(res.status === 200 && res.data.ok)) {
     if (res.data.error === "insufficient_presale") {
@@ -7486,6 +7634,11 @@ el("cdk-next-page").onclick = () => {
             batch_label = str(payload.get("batch_label") or "").strip()
             note = str(payload.get("note") or "").strip()
             expires_at = str(payload.get("expires_at") or "").strip()
+            pinned_raw = payload.get("pinned_addresses") or []
+            if isinstance(pinned_raw, list):
+                pinned_addresses = [str(a).strip() for a in pinned_raw if str(a).strip()]
+            else:
+                pinned_addresses = [a.strip() for a in str(pinned_raw).replace(",", "\n").split("\n") if a.strip()]
             result = self.app.store.generate_cdk_codes(
                 count,
                 tag_id=tag_id,
@@ -7495,6 +7648,7 @@ el("cdk-next-page").onclick = () => {
                 note=note,
                 expires_at=expires_at,
                 created_by=int(session_user["user_id"]),
+                pinned_addresses=pinned_addresses,
             )
             if not result.get("ok"):
                 self._send_json(HTTPStatus.CONFLICT, {
