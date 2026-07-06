@@ -2434,6 +2434,47 @@ class MailBridgeStore:
             return False, None, "mailbox_not_found"
         return True, self._mailbox_record_from_row(row), "ok"
 
+    def set_mailbox_status(self, mailbox_id: int, status: str) -> tuple[bool, str]:
+        # Admin manual pool move between presale/available/sold/deleted. 'available'
+        # needs a key to be redeemable; recovering to available/presale clears the
+        # buyer ownership so the mailbox is sellable again.
+        clean_id = int(mailbox_id or 0)
+        clean_status = str(status or "").strip().lower()
+        if clean_id <= 0:
+            return False, "invalid_mailbox_id"
+        if clean_status not in {"presale", "available", "sold", "deleted"}:
+            return False, "invalid_status"
+        now = utcnow_iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT access_key FROM mailbox_credentials WHERE id = ? LIMIT 1", (clean_id,)
+            ).fetchone()
+            if not row:
+                return False, "mailbox_not_found"
+            if clean_status == "available":
+                key = str(row["access_key"] or "") or generate_access_key()
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET status='available', active=1, access_key=?, owner_user_id=0, sold_at='', order_id=0, updated_at=? WHERE id=?",
+                    (key, now, clean_id),
+                )
+            elif clean_status == "presale":
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET status='presale', active=1, owner_user_id=0, sold_at='', order_id=0, updated_at=? WHERE id=?",
+                    (now, clean_id),
+                )
+            elif clean_status == "deleted":
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET status='deleted', active=0, updated_at=? WHERE id=?",
+                    (now, clean_id),
+                )
+            else:  # sold — leave key/owner as-is, just flip the pool flag
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET status='sold', updated_at=? WHERE id=?",
+                    (now, clean_id),
+                )
+            self._conn.commit()
+        return True, "ok"
+
     def delete_mailbox_credential(self, mailbox_id: int) -> tuple[bool, str]:
         # Soft delete: mark status='deleted' and deactivate. Tags, ownership and
         # mail are kept; redeem (status='available' only) already skips it.
@@ -5643,9 +5684,11 @@ function renderMailboxesTable() {
     const addressText = String(m.address || "").trim();
     const noteText = String(m.note || "").trim();
     const poolMap = { presale: ["预售池", "warn"], available: ["可兑换", "active"], sold: ["已售出", "inactive"], deleted: ["已删除", "inactive"] };
-    const pool = poolMap[m.status] || ["可兑换", "active"];
-    const statusLabel = m.active ? pool[0] : "停用";
-    const statusClass = m.active ? pool[1] : "inactive";
+    const curStatus = poolMap[m.status] ? m.status : "available";
+    const statusOptions = [["presale", "预售池"], ["available", "可兑换"], ["sold", "已售出"], ["deleted", "已删除"]]
+      .map(([v, label]) => `<option value="${v}"${v === curStatus ? " selected" : ""}>${label}</option>`)
+      .join("");
+    const statusCell = `<select data-a="set-status" data-id="${m.id}" class="status-select" title="修改状态">${statusOptions}</select>${m.active ? "" : '<span class="status-chip inactive" style="margin-left:4px">停用</span>'}`;
     const addressDisplay = addressText
       ? `<code class="email-preview" title="${escapeHtml(addressText)}">${escapeHtml(addressText)}</code>`
       : `<code>-</code>`;
@@ -5656,7 +5699,7 @@ function renderMailboxesTable() {
     const tagsDisplay = tags.length
       ? `<div class="tag-list">${tags.map((tag) => `<span class="tag-chip">${escapeHtml(tag.name || "")}</span>`).join("")}</div>`
       : "-";
-    tr.innerHTML = `<td>${m.id}</td><td>${addressDisplay}</td><td>${noteDisplay}</td><td>${tagsDisplay}</td><td><span class="status-chip ${statusClass}" title="${statusLabel}">${statusLabel}</span></td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
+    tr.innerHTML = `<td>${m.id}</td><td>${addressDisplay}</td><td>${noteDisplay}</td><td>${tagsDisplay}</td><td>${statusCell}</td><td>${formatDateOnly(m.created_at)}</td><td>${m.message_count || 0}</td>
       <td>
         <div class="table-actions">
           <button data-a="copy" data-id="${m.id}" class="icon-btn ghost" title="复制凭据" aria-label="复制凭据">⧉</button>
@@ -5965,6 +6008,22 @@ document.addEventListener("click", async (ev) => {
   }
 });
 
+document.addEventListener("change", async (ev) => {
+  const target = ev.target;
+  if (!target || !target.dataset || target.dataset.a !== "set-status") return;
+  const id = target.dataset.id;
+  const status = target.value;
+  const res = await api(`/web/admin/mailboxes/${id}/status`, { method: "POST", body: JSON.stringify({ status }) });
+  if (res.status === 200 && res.data.ok) {
+    setStatus("状态已更新", "ok");
+  } else {
+    setStatus(`状态更新失败: ${res.data.error || "操作失败"}`, "error");
+  }
+  await refreshMailboxes();
+  await refreshStats();
+  await refreshStock();
+});
+
 let mbMailsList = [];
 async function openMailboxMails(mailbox) {
   const res = await api(`/web/admin/mailboxes/${mailbox.id}/emails`, { method: "GET" });
@@ -5995,11 +6054,38 @@ async function openMailboxMails(mailbox) {
   el("mailboxMailsModal").classList.add("open");
 }
 function closeMailboxMails() { el("mailboxMailsModal").classList.remove("open"); }
+function openCdkMailboxes(data) {
+  const boxes = data.mailboxes || [];
+  const statusLabel = { presale: "预售池", available: "可兑换", sold: "已售出", deleted: "已删除" };
+  el("mbMailsTitle").textContent = `卡密绑定邮箱 · ${data.code || ""}`;
+  el("mbMailsSub").textContent = data.redeemed
+    ? `已兑换 · 共 ${boxes.length} 个邮箱，点击卡片复制凭据`
+    : "该卡密尚未被兑换，暂无绑定邮箱";
+  el("mbMailsList").innerHTML = boxes.length
+    ? boxes.map((b) => `
+        <article class="mail-item" data-copy-cred="${escapeHtml(b.credential || "")}">
+          <div class="mail-top">
+            <div>
+              <h3 class="mail-subject">${escapeHtml(b.address || "")}</h3>
+              <div class="mail-meta"><span class="mail-address mono">${escapeHtml(b.credential || "")}</span></div>
+            </div>
+            <div class="mail-meta"><span>${escapeHtml(statusLabel[b.status] || b.status || "")}</span></div>
+          </div>
+        </article>`).join("")
+    : '<div class="empty-state">暂无绑定邮箱</div>';
+  el("mailboxMailsModal").classList.add("open");
+}
 el("mbMailsClose").onclick = closeMailboxMails;
 el("mailboxMailsModal").addEventListener("click", (ev) => {
   if (ev.target === el("mailboxMailsModal")) closeMailboxMails();
 });
 el("mbMailsList").addEventListener("click", async (ev) => {
+  const copyCard = ev.target && typeof ev.target.closest === "function" ? ev.target.closest("[data-copy-cred]") : null;
+  if (copyCard) {
+    const cred = copyCard.getAttribute("data-copy-cred") || "";
+    if (cred) { const ok = await copyText(cred); setStatus(ok ? "凭据已复制" : "复制失败，请手动复制", ok ? "ok" : "error"); }
+    return;
+  }
   const card = ev.target && typeof ev.target.closest === "function" ? ev.target.closest("[data-open]") : null;
   if (!card) return;
   const id = card.getAttribute("data-open") || "";
@@ -6417,10 +6503,10 @@ el("cdk-list").addEventListener("click", async (ev) => {
       setCdkStatus(`查询失败: ${res.data.error || "操作失败"}`, "error");
       return;
     }
-    setResult(res.data);
+    openCdkMailboxes(res.data);
     const boxes = res.data.mailboxes || [];
     setCdkStatus(
-      res.data.redeemed ? `该卡密已绑定 ${boxes.length} 个邮箱，详情见下方结果面板` : "该卡密尚未被兑换，暂无绑定邮箱",
+      res.data.redeemed ? `该卡密已绑定 ${boxes.length} 个邮箱` : "该卡密尚未被兑换，暂无绑定邮箱",
       res.data.redeemed ? "ok" : ""
     );
     return;
@@ -7602,6 +7688,22 @@ el("cdk-next-page").onclick = () => {
                     },
                 },
             )
+            return
+        if parsed.path.startswith("/web/admin/mailboxes/") and parsed.path.endswith("/status"):
+            if not self._require_admin_session_user():
+                return
+            try:
+                payload = self._read_json_body()
+            except Exception as exc:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": f"invalid_json:{exc}"})
+                return
+            mailbox_id = self._extract_admin_mailbox_id(parsed.path)
+            success, reason = self.app.store.set_mailbox_status(mailbox_id, str(payload.get("status") or ""))
+            if not success:
+                status = HTTPStatus.NOT_FOUND if reason == "mailbox_not_found" else HTTPStatus.BAD_REQUEST
+                self._send_json(status, {"ok": False, "error": reason})
+                return
+            self._send_json(HTTPStatus.OK, {"ok": True})
             return
         if parsed.path.startswith("/web/admin/mailboxes/") and parsed.path.endswith("/delete"):
             if not self._require_admin_session_user():
