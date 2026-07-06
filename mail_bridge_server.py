@@ -720,6 +720,20 @@ class MailBridgeStore:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mailbox_inventory ON mailbox_credentials(status, active)"
             )
+            # One-time backfill: presale stock imported before keys were generated
+            # at import time carries an empty access_key, so the admin "copy" gives
+            # no credential. Give each a usable key. Idempotent (empty keys only).
+            empty_key_ids = [
+                int(r[0])
+                for r in self._conn.execute(
+                    "SELECT id FROM mailbox_credentials WHERE status='presale' AND (access_key IS NULL OR access_key='')"
+                ).fetchall()
+            ]
+            for mid in empty_key_ids:
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET access_key=? WHERE id=?",
+                    (generate_access_key(), mid),
+                )
             self._conn.commit()
 
     def save_message(self, payload: Dict[str, Any]) -> MailRecord:
@@ -1221,13 +1235,15 @@ class MailBridgeStore:
             ).fetchall()
             existing_set = {row["address"] for row in existing_rows}
 
-            new_rows = [(addr, clean_note, now, now) for _, _, addr in valid_items if addr not in existing_set]
+            # New presale rows get a usable key up front (like the CSV import and
+            # reset-key) so admins can copy a working credential immediately.
+            new_rows = [(addr, generate_access_key(), clean_note, now, now) for _, _, addr in valid_items if addr not in existing_set]
             # ponytail: generate_access_key per existing address — same behaviour as reset_mailbox_access_key
             reset_rows = [(generate_access_key(), now, addr) for _, _, addr in valid_items if addr in existing_set]
 
             if new_rows:
                 self._conn.executemany(
-                    "INSERT OR IGNORE INTO mailbox_credentials (address, access_key, active, status, note, created_at, updated_at) VALUES (?, '', 1, 'presale', ?, ?, ?)",
+                    "INSERT OR IGNORE INTO mailbox_credentials (address, access_key, active, status, note, created_at, updated_at) VALUES (?, ?, 1, 'presale', ?, ?, ?)",
                     new_rows,
                 )
             if reset_rows:
