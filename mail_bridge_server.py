@@ -3769,6 +3769,7 @@ el("login-form").onsubmit = async (ev) => {
           <div id="redeem-status" class="message-area"></div>
           <div id="redeem-result" class="email-list" style="margin-top:14px"></div>
           <div class="admin-entry">需要长期管理已购邮箱？ <a href="/web/user">登录 / 注册账号 →</a></div>
+          <div class="admin-entry">换了设备或清除了浏览器缓存？<span style="color:var(--muted)"> 重新输入原卡密兑换即可找回已购邮箱。</span></div>
         </section>
       </div>
 
@@ -3780,6 +3781,7 @@ el("login-form").onsubmit = async (ev) => {
               <div class="search-caption-sub">点击「查邮件」自动填入密钥并查询</div>
             </div>
           </div>
+          <input id="my-mailbox-search" placeholder="搜索邮箱地址…" autocomplete="off" style="display:none; width:100%; margin-bottom:8px; border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:13px;">
           <div id="my-mailbox-list" class="mailbox-list"></div>
         </section>
         <section class="search-panel card">
@@ -3796,7 +3798,7 @@ el("login-form").onsubmit = async (ev) => {
             <button id="search-button" class="button-primary" type="button">搜索</button>
           </div>
           <label style="display:inline-flex; align-items:center; gap:6px; margin-top:10px; font-size:13px; color:var(--muted); cursor:pointer;">
-            <input type="checkbox" id="auto-refresh"> 自动刷新（每 5 秒，方便等验证码邮件）
+            <input type="checkbox" id="auto-refresh"> <span id="auto-refresh-label">自动刷新（每 5 秒，方便等验证码邮件）</span>
           </label>
           <div id="totalResultsInfo" class="total-results-info"></div>
           <div id="messageArea" class="message-area"></div>
@@ -3973,9 +3975,13 @@ function stopAutoRefresh() {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   const cb = el("auto-refresh");
   if (cb) cb.checked = false;
+  const lbl = el("auto-refresh-label");
+  if (lbl) lbl.textContent = "自动刷新（每 5 秒，方便等验证码邮件）";
 }
 function startAutoRefresh() {
   if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  const lbl = el("auto-refresh-label");
+  if (lbl) lbl.textContent = "🔄 自动刷新中（每 5 秒）…";
   autoRefreshTimer = setInterval(() => {
     const cb = el("auto-refresh");
     if (!cb || !cb.checked) { stopAutoRefresh(); return; }
@@ -4004,6 +4010,7 @@ async function queryMails(silent) {
     const topId = currentItems.length ? currentItems[0].id : null;
     if (silent && topId && lastTopMailId !== null && topId !== lastTopMailId) {
       setStatus("🔔 收到新邮件", "ok");
+      setTimeout(() => setStatus(""), 4000);
     } else if (!silent) {
       setStatus("查询成功", "ok");
     }
@@ -4064,7 +4071,7 @@ async function openMailDetail(mailId) {
   el("modalFrom").textContent = email.from || "-";
   el("modalTo").textContent = email.to || "-";
   el("modalDate").textContent = formatBeijingDateTime(email.received_at);
-  el("modalType").textContent = email.mail_type || "unknown";
+  el("modalType").textContent = typeLabel(email.mail_type);
   setModalView("rendered");
   el("emailModal").classList.add("open");
 }
@@ -4143,18 +4150,23 @@ async function copyText(text) {
 function renderMyMailboxes() {
   const panel = el("my-mailbox-panel");
   const box = el("my-mailbox-list");
+  const searchEl = el("my-mailbox-search");
   if (!panel || !box) return;
-  const list = loadMailboxes();
-  if (!list.length) { panel.style.display = "none"; box.innerHTML = ""; return; }
+  const all = loadMailboxes();
+  if (!all.length) { panel.style.display = "none"; box.innerHTML = ""; if (searchEl) searchEl.style.display = "none"; return; }
   panel.style.display = "";
-  box.innerHTML = list.map((m) => `
+  if (searchEl) searchEl.style.display = all.length > 4 ? "" : "none";
+  const q = searchEl ? searchEl.value.trim().toLowerCase() : "";
+  const list = q ? all.filter((m) => m.address.toLowerCase().includes(q)) : all;
+  box.innerHTML = list.length ? list.map((m) => `
     <div class="mailbox-row" data-addr="${escapeHtml(m.address)}">
       <span class="addr">${escapeHtml(m.address)}</span>
       <button class="button-primary" data-act="view" type="button">查邮件</button>
       <button class="button-ghost" data-act="copy" type="button">复制</button>
       <button class="button-ghost" data-act="del" type="button">删除</button>
-    </div>`).join("");
+    </div>`).join("") : `<div style="padding:8px;color:var(--muted)">无匹配邮箱</div>`;
 }
+if (el("my-mailbox-search")) el("my-mailbox-search").addEventListener("input", renderMyMailboxes);
 el("my-mailbox-list").addEventListener("click", async (ev) => {
   const btn = ev.target.closest("button");
   const row = ev.target.closest(".mailbox-row");
@@ -4171,16 +4183,17 @@ el("my-mailbox-list").addEventListener("click", async (ev) => {
 // ---- 兑换 CDK ----
 function getRedeemErrorMessage(code) {
   const c = String(code || "");
-  if (c === "cdk_not_found") return "卡密不存在，请检查后重试";
-  if (c === "cdk_used") return "该卡密已被使用";
-  if (c === "cdk_expired") return "该卡密已过期";
-  if (c === "cdk_disabled") return "该卡密已停用";
-  if (c === "insufficient_stock") return "库存不足，请联系卖家补货";
+  const contact = "，如需帮助请联系购买渠道卖家";
+  if (c === "cdk_not_found") return "卡密不存在，请检查是否输入有误" + contact;
+  if (c === "cdk_used") return "该卡密已被使用（重新输入同一卡密可找回已购邮箱）";
+  if (c === "cdk_expired") return "该卡密已过期" + contact;
+  if (c === "cdk_disabled") return "该卡密已停用" + contact;
+  if (c === "insufficient_stock") return "库存不足" + contact;
   if (c === "missing_code") return "请输入卡密";
   if (c === "too_many_attempts") return "操作过于频繁，请稍后再试";
   if (c === "payload_too_large") return "请求内容过大";
-  if (c === "mailbox_unavailable") return "该卡密绑定的邮箱已不可用，请联系卖家";
-  return "兑换失败，请稍后重试";
+  if (c === "mailbox_unavailable") return "该卡密绑定的邮箱已不可用" + contact;
+  return "兑换失败，请稍后重试" + contact;
 }
 function setRedeemStatus(text, kind = "") {
   const node = el("redeem-status");
@@ -4190,6 +4203,8 @@ function setRedeemStatus(text, kind = "") {
 async function redeem() {
   const code = el("cdk-code").value.trim();
   if (!code) { setRedeemStatus("请输入卡密", "error"); return; }
+  const btn = el("btn-redeem");
+  btn.disabled = true;
   setRedeemStatus("兑换中...", "");
   const res = await api("/web/user/redeem", { method: "POST", body: JSON.stringify({ code }) });
   if (res.status === 200 && res.data.ok) {
@@ -4212,10 +4227,12 @@ async function redeem() {
           <button class="button-primary" data-redeem-view="${escapeHtml(m.credential)}" type="button">查邮件</button>
         </div>
       </article>`).join("");
+    btn.disabled = false;
     return;
   }
   el("redeem-result").innerHTML = "";
   setRedeemStatus(getRedeemErrorMessage(res.data.error), "error");
+  btn.disabled = false;
 }
 el("btn-redeem").onclick = redeem;
 el("cdk-code").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); redeem(); } });
@@ -4242,7 +4259,8 @@ el("btn-bulk-submit").onclick = async () => {
       const boxes = (res.data.mailboxes || []).map((m) => ({ ...m, code }));
       allBoxes.push(...boxes);
       okCount++;
-      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxes.map((b) => escapeHtml(b.address)).join("、") || "已发放"}</div>`);
+      const boxLines = boxes.map((b) => escapeHtml(b.address) + (b.access_key ? `<span class="muted">----${escapeHtml(b.access_key)}</span>` : "")).join("<br>");
+      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxLines || "已发放"}</div>`);
     } else {
       failCount++;
       lines.push(`<div class="bulk-line err">❌ ${escapeHtml(code)} → ${escapeHtml(getRedeemErrorMessage(res.data.error))}</div>`);
@@ -4362,6 +4380,14 @@ renderMyMailboxes();
       <button id="btn-logout" class="secondary" style="display:none">退出登录</button>
     </div>
   </header>
+  <div id="u-change-pass-bar" style="display:none; padding:10px 24px; background:var(--surface); border-bottom:1px solid var(--line); align-items:center; gap:10px; flex-wrap:wrap;">
+    <span style="font-size:13px; font-weight:600;">修改密码</span>
+    <input id="u-cp-old" type="password" placeholder="当前密码" autocomplete="current-password" style="width:150px">
+    <input id="u-cp-new" type="password" placeholder="新密码（至少6位）" autocomplete="new-password" style="width:150px">
+    <button id="u-cp-submit" type="button" class="button-primary">确认修改</button>
+    <button id="u-cp-cancel" type="button" class="ghost">取消</button>
+    <span id="u-cp-status" class="status" style="margin:0; font-size:13px;"></span>
+  </div>
 
   <main class="wrap">
     <!-- 未登录：登录 / 注册 -->
@@ -4410,6 +4436,9 @@ renderMyMailboxes();
           <div class="panel-head">
             <h2 class="title">收件箱 <span id="inbox-addr" class="muted" style="font-weight:600; font-size:13px;"></span></h2>
             <button id="btn-inbox-refresh" class="ghost" style="display:none">刷新</button>
+            <label id="inbox-auto-label" style="display:none; align-items:center; gap:4px; font-size:12px; color:var(--muted); cursor:pointer; font-weight:400;">
+              <input type="checkbox" id="inbox-auto-refresh" style="width:14px;height:14px;min-height:0;"> <span id="inbox-auto-text">自动刷新（5秒）</span>
+            </label>
           </div>
           <div id="inbox-list" class="inbox-list"></div>
           <div id="inbox-status" class="status"></div>
@@ -4583,7 +4612,7 @@ function openMailModal(email, address) {
     el("modalFrom").textContent = email.from || "-";
     el("modalTo").textContent = email.to || address || "-";
     el("modalDate").textContent = formatBeijingDateTime(email.received_at);
-    el("modalType").textContent = email.mail_type || "未分类";
+    el("modalType").textContent = ({verification_code:"验证码",team_invite:"邀请邮件"}[email.mail_type]) || (email.mail_type ? email.mail_type : "普通邮件");
   }
   setModalView("rendered");
   el("emailModal").classList.add("open");
@@ -4664,7 +4693,7 @@ async function loadMailboxes() {
   rerenderMailboxes();
   setStatus(`共 ${cachedMailboxes.length} 个邮箱`, cachedMailboxes.length ? "ok" : "");
   if (selectedAddress) await loadInbox(selectedAddress);
-  else { el("inbox-addr").textContent = ""; el("btn-inbox-refresh").style.display = "none"; renderInbox(null); setInboxStatus(""); }
+  else { el("inbox-addr").textContent = ""; el("btn-inbox-refresh").style.display = "none"; el("inbox-auto-label").style.display = "none"; stopInboxAutoRefresh(); renderInbox(null); setInboxStatus(""); }
   return cachedMailboxes;
 }
 
@@ -4699,7 +4728,7 @@ function renderInbox(emails) {
       </div>
       <div class="inbox-from">${escapeHtml(email.from || "未知发件人")}</div>
       <div class="inbox-preview">${escapeHtml(inboxPreview(email))}</div>
-      ${code ? `<span class="pill inbox-code">验证码 ${escapeHtml(code)}</span>` : ""}`;
+      ${code ? `<button type="button" class="pill inbox-code" data-copy-code="${escapeHtml(code)}" style="cursor:pointer;border:none;background:var(--accent-soft,#e8f4fd);">验证码 ${escapeHtml(code)}　复制</button>` : ""}`;
     list.appendChild(item);
   });
 }
@@ -4709,6 +4738,7 @@ async function loadInbox(address) {
   if (!addr) return;
   el("inbox-addr").textContent = `· ${addr}`;
   el("btn-inbox-refresh").style.display = "";
+  el("inbox-auto-label").style.display = "flex";
   setInboxStatus("加载中...", "");
   el("inbox-list").innerHTML = '<div class="inbox-empty">加载中…</div>';
   const res = await api(`/web/me/messages?address=${encodeURIComponent(addr)}`);
@@ -4746,7 +4776,7 @@ el("mailbox-list").addEventListener("click", async (ev) => {
   }
   const delAddr = t.getAttribute("data-delete");
   if (delAddr) {
-    if (!confirm(`确定从「我的邮箱」移除 ${delAddr}？（凭原兑换码仍可找回）`)) return;
+    if (!(await confirmAction(`确定从「我的邮箱」移除 ${delAddr}？\n凭原兑换码仍可找回。`))) return;
     setStatus("删除中...", "");
     const res = await api("/web/me/mailboxes/delete", { method: "POST", body: JSON.stringify({ address: delAddr }) });
     if (res.status === 200 && res.data.ok && res.data.deleted) {
@@ -4774,11 +4804,18 @@ el("mailbox-list").addEventListener("click", async (ev) => {
   }
   const resetAddr = t.getAttribute("data-reset-key");
   if (resetAddr) {
-    if (!confirm(`确定重置 ${resetAddr} 的访问密钥？旧密钥将立即失效。`)) return;
+    if (!(await confirmAction(`确定重置 ${resetAddr} 的访问密钥？\n旧密钥将立即失效。`))) return;
     setStatus("重置中...", "");
     const res = await api("/web/me/mailboxes/reset-key", { method: "POST", body: JSON.stringify({ address: resetAddr }) });
     if (res.status === 200 && res.data.ok) {
-      setStatus("密钥已重置，请使用新凭据", "ok");
+      const newCred = `${res.data.address}----${res.data.access_key}`;
+      const statusEl = el("status");
+      if (statusEl) {
+        statusEl.innerHTML = `密钥已重置，新凭据：<code style="user-select:all;word-break:break-all">${escapeHtml(newCred)}</code> <button type="button" id="reset-copy-btn" class="ghost" style="font-size:12px">复制</button>`;
+        statusEl.className = "status ok";
+        const copyBtn = el("reset-copy-btn");
+        if (copyBtn) copyBtn.onclick = async () => { await copyText(newCred); copyBtn.textContent = "已复制"; };
+      }
       await loadMailboxes();
     } else {
       setStatus(`重置失败: ${res.data.error || "操作失败"}`, "error");
@@ -4794,7 +4831,15 @@ el("mailbox-list").addEventListener("click", async (ev) => {
   setStatus(ok ? "已复制邮箱地址" : "复制失败，请手动复制", ok ? "ok" : "error");
 });
 
-el("inbox-list").addEventListener("click", (ev) => {
+el("inbox-list").addEventListener("click", async (ev) => {
+  const copyBtn = ev.target && typeof ev.target.closest === "function" ? ev.target.closest("[data-copy-code]") : null;
+  if (copyBtn) {
+    ev.stopPropagation();
+    await copyText(copyBtn.dataset.copyCode);
+    const orig = copyBtn.textContent; copyBtn.textContent = "已复制 ✓";
+    setTimeout(() => { copyBtn.textContent = orig; }, 1200);
+    return;
+  }
   const target = ev.target && typeof ev.target.closest === "function" ? ev.target.closest(".inbox-item") : null;
   if (!target) return;
   const idx = parseInt(target.getAttribute("data-email-index"), 10);
@@ -4814,7 +4859,7 @@ el("mb-check-all").addEventListener("change", (ev) => {
 el("btn-batch-delete").onclick = async () => {
   const addresses = [...selectedForDelete];
   if (!addresses.length) return;
-  if (!confirm(`确定从「我的邮箱」移除选中的 ${addresses.length} 个邮箱？（凭原兑换码仍可找回）`)) return;
+  if (!(await confirmAction(`确定从「我的邮箱」移除选中的 ${addresses.length} 个邮箱？（凭原兑换码仍可找回）`))) return;
   setStatus("批量删除中...", "");
   const res = await api("/web/me/mailboxes/delete", { method: "POST", body: JSON.stringify({ addresses }) });
   if (res.status === 200 && res.data.ok) {
@@ -4827,6 +4872,24 @@ el("btn-batch-delete").onclick = async () => {
   }
 };
 el("btn-inbox-refresh").onclick = async () => { if (selectedAddress) await loadInbox(selectedAddress); };
+let inboxAutoTimer = null;
+function stopInboxAutoRefresh() {
+  if (inboxAutoTimer) { clearInterval(inboxAutoTimer); inboxAutoTimer = null; }
+  const cb = el("inbox-auto-refresh"); if (cb) cb.checked = false;
+  const t = el("inbox-auto-text"); if (t) t.textContent = "自动刷新（5秒）";
+}
+function startInboxAutoRefresh() {
+  if (inboxAutoTimer) clearInterval(inboxAutoTimer);
+  const t = el("inbox-auto-text"); if (t) t.textContent = "🔄 刷新中…";
+  inboxAutoTimer = setInterval(() => {
+    if (!selectedAddress) { stopInboxAutoRefresh(); return; }
+    if (document.hidden) return;
+    loadInbox(selectedAddress);
+  }, 5000);
+}
+el("inbox-auto-refresh").addEventListener("change", (ev) => {
+  if (ev.target.checked && selectedAddress) startInboxAutoRefresh(); else stopInboxAutoRefresh();
+});
 el("closeModalButton").onclick = closeModal;
 el("viewRawButton").onclick = () => setModalView("raw");
 el("viewRenderedButton").onclick = () => setModalView("rendered");
@@ -4883,7 +4946,8 @@ el("btn-bulk-submit").onclick = async () => {
     if (res.status === 200 && res.data.ok) {
       const boxes = res.data.mailboxes || [];
       boxCount += boxes.length; okCount++;
-      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxes.map((b) => escapeHtml(b.address)).join("、") || "已发放"}</div>`);
+      const boxLines = boxes.map((b) => escapeHtml(b.address) + (b.access_key ? `<span class="muted">----${escapeHtml(b.access_key)}</span>` : "")).join("<br>");
+      lines.push(`<div class="bulk-line ok">✅ ${escapeHtml(code)} → ${boxLines || "已发放"}</div>`);
     } else {
       failCount++;
       lines.push(`<div class="bulk-line err">❌ ${escapeHtml(code)} → ${escapeHtml(redeemErrMsg(res.data.error))}</div>`);
@@ -4895,16 +4959,32 @@ el("btn-bulk-submit").onclick = async () => {
   submit.disabled = false;
 };
 
-el("btn-change-pass").onclick = async () => {
-  const oldPassword = prompt("请输入当前密码");
-  if (!oldPassword) return;
-  const newPassword = prompt("请输入新密码（至少6位）");
-  if (!newPassword) return;
-  const res = await api("/web/me/change-password", {
-    method: "POST",
-    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
-  });
-  alert(res.status === 200 && res.data.ok ? "密码修改成功，请使用新密码登录。" : `修改失败: ${res.data.error || "操作失败"}`);
+el("btn-change-pass").onclick = () => {
+  const bar = el("u-change-pass-bar");
+  const visible = bar.style.display === "flex";
+  bar.style.display = visible ? "none" : "flex";
+  if (!visible) { el("u-cp-old").focus(); el("u-cp-status").textContent = ""; }
+};
+el("u-cp-cancel").onclick = () => { el("u-change-pass-bar").style.display = "none"; el("u-cp-old").value = ""; el("u-cp-new").value = ""; el("u-cp-status").textContent = ""; };
+["u-cp-old", "u-cp-new"].forEach((id) => el(id).addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); el("u-cp-submit").click(); } }));
+el("u-cp-submit").onclick = async () => {
+  const oldPassword = el("u-cp-old").value;
+  const newPassword = el("u-cp-new").value;
+  const st = el("u-cp-status");
+  if (!oldPassword || !newPassword) { st.textContent = "请填写全部字段"; st.className = "status error"; return; }
+  if (newPassword.length < 6) { st.textContent = "新密码至少6位"; st.className = "status error"; return; }
+  st.textContent = "修改中..."; st.className = "status";
+  el("u-cp-submit").disabled = true;
+  const res = await api("/web/me/change-password", { method: "POST", body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }) });
+  el("u-cp-submit").disabled = false;
+  if (res.status === 200 && res.data.ok) {
+    st.textContent = "密码修改成功"; st.className = "status ok";
+    el("u-cp-old").value = ""; el("u-cp-new").value = "";
+    setTimeout(() => { el("u-change-pass-bar").style.display = "none"; st.textContent = ""; }, 1500);
+    return;
+  }
+  const errMap = { wrong_password: "当前密码错误", password_too_short: "新密码至少6位" };
+  st.textContent = errMap[res.data.error] || `修改失败: ${res.data.error || "操作失败"}`; st.className = "status error";
 };
 
 el("btn-logout").onclick = async () => {
@@ -4987,8 +5067,26 @@ async function boot() {
     showAuth();
   }
 }
+function confirmAction(msg) {
+  return new Promise((resolve) => {
+    const dlg = el("user-confirm-dlg");
+    el("user-confirm-msg").textContent = msg;
+    dlg.showModal();
+    const finish = (v) => { dlg.close(); resolve(v); };
+    el("user-confirm-ok").onclick = () => finish(true);
+    el("user-confirm-cancel").onclick = () => finish(false);
+    dlg.onclose = () => resolve(false);
+  });
+}
 boot();
 </script>
+<dialog id="user-confirm-dlg" style="border:1px solid var(--line); border-radius:12px; padding:20px 24px; min-width:300px; background:var(--card); color:var(--text);">
+  <p id="user-confirm-msg" style="margin:0 0 14px; line-height:1.5;"></p>
+  <div style="display:flex; gap:8px; justify-content:flex-end;">
+    <button id="user-confirm-cancel" type="button" class="secondary">取消</button>
+    <button id="user-confirm-ok" type="button" class="button-primary danger">确认</button>
+  </div>
+</dialog>
 </body>
 </html>"""
 
@@ -5155,6 +5253,14 @@ boot();
       <button id="btn-logout" class="secondary">退出登录</button>
     </div>
   </header>
+  <div id="change-pass-bar" style="display:none; padding:10px 24px; background:var(--surface); border-bottom:1px solid var(--line); align-items:center; gap:10px; flex-wrap:wrap;">
+    <span style="font-size:13px; font-weight:600;">修改密码</span>
+    <input id="cp-old" type="password" placeholder="当前密码" autocomplete="current-password" style="width:160px">
+    <input id="cp-new" type="password" placeholder="新密码（至少6位）" autocomplete="new-password" style="width:160px">
+    <button id="cp-submit" type="button" class="button-primary">确认修改</button>
+    <button id="cp-cancel" type="button" class="ghost">取消</button>
+    <span id="cp-status" class="status" style="margin:0; font-size:13px;"></span>
+  </div>
   <div class="layout">
     <nav class="nav" id="nav">
       <button class="nav-item active" data-view="dashboard"><span class="nav-ico">▣</span><span>概览</span></button>
@@ -5175,8 +5281,10 @@ boot();
             <div class="stat-grid">
               <div class="stat-card"><span class="stat-label">邮箱总数</span><strong id="stat-mailboxes" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">启用邮箱</span><strong id="stat-active" class="stat-value">-</strong></div>
+              <div class="stat-card"><span class="stat-label">已售邮箱</span><strong id="stat-sold" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">标签数</span><strong id="stat-tags" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">收件总数</span><strong id="stat-inbox" class="stat-value">-</strong></div>
+              <div class="stat-card"><span class="stat-label">CDK兑换次数</span><strong id="stat-cdk-redeems" class="stat-value">-</strong></div>
             </div>
             <p class="muted" style="margin-top:14px">数据来自当前邮箱与收件箱统计；点击左侧导航查看明细。</p>
           </div>
@@ -5291,7 +5399,7 @@ boot();
                 </label>
                 <label class="field">
                   <span class="field-label">邮箱列表</span>
-                  <textarea id="bulk-mailboxes" class="mono" placeholder="alpha@example.com&#10;bravo@example.com&#10;charlie@icloud.com"></textarea>
+                  <textarea id="bulk-mailboxes" class="mono" placeholder="alpha@example.com&#10;bravo@example.com----自定义密钥&#10;charlie@icloud.com&#10;（每行一个；可选带密钥格式：邮箱----密钥）"></textarea>
                 </label>
                 <button id="btn-bulk-import" class="button-block">批量创建</button>
               </div>
@@ -5367,10 +5475,13 @@ boot();
                 <span class="field-label">生成数量</span>
                 <input id="cdk-count" type="number" min="1" value="10">
               </label>
-              <label class="field">
+              <div class="field">
                 <span class="field-label">有效期（可选）</span>
-                <input id="cdk-expires" type="datetime-local">
-              </label>
+                <div style="display:flex;gap:6px;align-items:center">
+                  <input id="cdk-expires" type="datetime-local" style="flex:1">
+                  <button type="button" class="ghost" style="font-size:12px;padding:2px 8px;white-space:nowrap" onclick="el('cdk-expires').value=''">清除</button>
+                </div>
+              </div>
               <label class="field">
                 <span class="field-label">批次标签（可选）</span>
                 <input id="cdk-batch" placeholder="例如：闲鱼-0627">
@@ -5446,6 +5557,7 @@ boot();
             <div class="mail-pagination">
               <span id="cdk-page-info" class="tag">第 1 页</span>
               <div class="page-buttons">
+                <button id="cdk-first-page" class="secondary">首页</button>
                 <button id="cdk-prev-page" class="secondary">上一页</button>
                 <button id="cdk-next-page" class="secondary">下一页</button>
               </div>
@@ -5476,6 +5588,7 @@ boot();
           <div class="mail-pagination">
             <div class="muted">点击任意邮件卡片查看详情</div>
             <div class="page-buttons">
+              <button id="inbox-first-page" class="secondary">首页</button>
               <button id="inbox-prev-page" class="secondary">上一页</button>
               <button id="inbox-next-page" class="secondary">下一页</button>
             </div>
@@ -6016,7 +6129,8 @@ el("btn-export-mailboxes").onclick = () => {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   window.location.href = `/web/admin/mailboxes/export.csv${suffix}`;
 };
-el("search-mailbox").oninput = () => refreshMailboxes(true);
+let mailboxSearchTimer;
+el("search-mailbox").oninput = () => { clearTimeout(mailboxSearchTimer); mailboxSearchTimer = setTimeout(() => refreshMailboxes(true), 300); };
 el("filter-tag").onchange = async () => {
   tagFilterValue = el("filter-tag").value;
   await refreshMailboxes(true);
@@ -6092,22 +6206,33 @@ el("btn-logout").onclick = async () => {
   location.href = "/web/query";
 };
 
-el("btn-change-pass").onclick = async () => {
-  const oldPassword = prompt("请输入当前密码");
-  if (!oldPassword) return;
-  const newPassword = prompt("请输入新密码（至少6位）");
-  if (!newPassword) return;
-  setStatus("正在修改密码...", "");
-  const res = await api("/web/me/change-password", {
-    method: "POST",
-    body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }),
-  });
-  setResult(res.data);
+el("btn-change-pass").onclick = () => {
+  const bar = el("change-pass-bar");
+  const visible = bar.style.display === "flex";
+  bar.style.display = visible ? "none" : "flex";
+  if (!visible) { el("cp-old").focus(); el("cp-status").textContent = ""; }
+};
+el("cp-cancel").onclick = () => { el("change-pass-bar").style.display = "none"; el("cp-old").value = ""; el("cp-new").value = ""; el("cp-status").textContent = ""; };
+["cp-old", "cp-new"].forEach((id) => el(id).addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); el("cp-submit").click(); } }));
+el("cp-submit").onclick = async () => {
+  const oldPassword = el("cp-old").value;
+  const newPassword = el("cp-new").value;
+  const st = el("cp-status");
+  if (!oldPassword || !newPassword) { st.textContent = "请填写全部字段"; st.className = "status error"; return; }
+  if (newPassword.length < 6) { st.textContent = "新密码至少6位"; st.className = "status error"; return; }
+  st.textContent = "修改中..."; st.className = "status";
+  el("cp-submit").disabled = true;
+  const res = await api("/web/me/change-password", { method: "POST", body: JSON.stringify({ old_password: oldPassword, new_password: newPassword }) });
+  el("cp-submit").disabled = false;
   if (res.status === 200 && res.data.ok) {
-    setStatus("密码修改成功。", "ok");
+    st.textContent = "密码修改成功"; st.className = "status ok";
+    el("cp-old").value = ""; el("cp-new").value = "";
+    setTimeout(() => { el("change-pass-bar").style.display = "none"; st.textContent = ""; }, 1500);
     return;
   }
-  setStatus(`修改失败: ${res.data.error || "操作失败"}`, "error");
+  const errMap = { wrong_password: "当前密码错误", password_too_short: "新密码至少6位" };
+  st.textContent = errMap[res.data.error] || res.data.error || "修改失败";
+  st.className = "status error";
 };
 
 document.addEventListener("click", async (ev) => {
@@ -6130,7 +6255,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (action === "edit-note") {
-    const nextNote = prompt("请输入备注", mailbox.note || "");
+    const nextNote = await promptNote(mailbox.note || "");
     if (nextNote === null) return;
     const res = await api(`/web/admin/mailboxes/${id}/note`, { method: "POST", body: JSON.stringify({ note: nextNote }) });
     setResult(res.data);
@@ -6429,13 +6554,15 @@ async function openMailDetail(mailId) {
   el("modalFrom").textContent = email.from || "-";
   el("modalTo").textContent = email.to || "-";
   el("modalDate").textContent = formatBeijingDateTime(email.received_at);
-  el("modalType").textContent = email.mail_type || "unknown";
+  el("modalType").textContent = ({verification_code:"验证码",team_invite:"邀请邮件"}[email.mail_type]) || (email.mail_type ? email.mail_type : "普通邮件");
   setModalView("rendered");
   el("emailModal").classList.add("open");
 }
 
 el("inbox-refresh").onclick = async () => { await refreshInbox(); };
-el("search-inbox").oninput = async () => { await refreshInbox(); };
+let inboxSearchTimer;
+el("search-inbox").oninput = () => { clearTimeout(inboxSearchTimer); inboxSearchTimer = setTimeout(() => refreshInbox(), 300); };
+el("inbox-first-page").onclick = async () => { inboxPagination.offset = 0; await refreshInbox(); };
 el("inbox-prev-page").onclick = async () => {
   inboxPagination.offset = Math.max(0, inboxPagination.offset - inboxPagination.limit);
   await refreshInbox();
@@ -6462,19 +6589,25 @@ el("emailModal").addEventListener("click", (ev) => {
 // ---- 概览视图 ----
 let dashboardLoaded = false;
 async function loadDashboard() {
-  const [mb, ib] = await Promise.all([
+  const [mb, ib, cdk] = await Promise.all([
     api("/web/admin/mailboxes?limit=200"),
     api("/web/admin/inbox/list?limit=1"),
+    api("/web/admin/cdks?limit=200"),
   ]);
   if (mb.status === 200 && mb.data.ok) {
     const list = mb.data.mailboxes || [];
     el("stat-mailboxes").textContent = String(mb.data.total != null ? mb.data.total : list.length);
-    // ponytail: 启用数统计前 200 个邮箱即可，精确全量统计需后端再加聚合接口
+    // ponytail: 启用数/已售数统计前 200 个邮箱即可，精确全量统计需后端再加聚合接口
     el("stat-active").textContent = String(list.filter((m) => m.active).length);
+    el("stat-sold").textContent = String(list.filter((m) => m.status === "sold").length);
   }
   el("stat-tags").textContent = String(tagCache.length);
   if (ib.status === 200 && ib.data.ok) {
     el("stat-inbox").textContent = String(ib.data.total != null ? ib.data.total : 0);
+  }
+  if (cdk.status === 200 && cdk.data.ok) {
+    const cdks = cdk.data.cdks || [];
+    el("stat-cdk-redeems").textContent = String(cdks.reduce((s, c) => s + (c.used_count || 0), 0));
   }
   dashboardLoaded = true;
 }
@@ -6587,14 +6720,19 @@ async function refreshCdks(resetOffset) {
   if (cdkPagination.keyword) params.set("keyword", cdkPagination.keyword);
   if (cdkPagination.status) params.set("status", cdkPagination.status);
   if (cdkPagination.tagId) params.set("tag_id", cdkPagination.tagId);
-  const res = await api(`/web/admin/cdks?${params.toString()}`);
+  ["cdk-first-page", "cdk-prev-page", "cdk-next-page"].forEach((id) => { if (el(id)) el(id).disabled = true; });
+  let res;
+  try { res = await api(`/web/admin/cdks?${params.toString()}`); } finally {
+    ["cdk-first-page", "cdk-prev-page", "cdk-next-page"].forEach((id) => { if (el(id)) el(id).disabled = false; });
+  }
   const list = el("cdk-list");
   if (!(res.status === 200 && res.data.ok)) { list.innerHTML = '<div class="empty-state">加载失败</div>'; return; }
   const items = res.data.cdks || [];
   cdkPagination.total = Number(res.data.total || 0);
   const stateLabel = { active: "可用", used: "已用", expired: "已过期", disabled: "已撤销" };
   if (!items.length) {
-    list.innerHTML = '<div class="empty-state">暂无卡密</div>';
+    const hasFilter = cdkPagination.keyword || cdkPagination.status || cdkPagination.tagId;
+    list.innerHTML = `<div class="empty-state">${hasFilter ? "无匹配卡密" : "暂无卡密"}</div>`;
   } else {
     list.innerHTML = items.map((c) => `
       <div class="mail-item">
@@ -6608,13 +6746,14 @@ async function refreshCdks(resetOffset) {
         <div style="margin-top:6px; display:flex; gap:8px">
           <button class="ghost" data-cdk-copy="${escapeHtml(c.code)}">复制</button>
           <button class="ghost" data-cdk-view-mailboxes="${c.id}">查看邮箱</button>
-          ${c.active ? `<button class="secondary" data-cdk-revoke="${c.id}">撤销</button>` : ""}
+          ${c.active ? `<button class="secondary danger" data-cdk-revoke="${c.id}">撤销</button>` : ""}
         </div>
       </div>
     `).join("");
   }
   const page = Math.floor(cdkPagination.offset / cdkPagination.limit) + 1;
-  el("cdk-page-info").textContent = `第 ${page} 页`;
+  const totalPages = Math.ceil(cdkPagination.total / cdkPagination.limit) || 1;
+  el("cdk-page-info").textContent = `第 ${page}/${totalPages} 页`;
   el("cdk-summary").textContent = `共 ${cdkPagination.total} 条`;
 }
 el("btn-gen-cdk").onclick = async () => {
@@ -6650,16 +6789,29 @@ el("btn-gen-cdk").onclick = async () => {
     resultPayload: res.data,
   });
   setCdkStatus(`已生成 ${codes.length} 个卡密`, "ok");
+  setTimeout(() => setCdkStatus(""), 5000);
   await refreshStats();
   await refreshStock();
   await refreshCdks(true);
   button.disabled = false;
 };
+el("cdk-pinned").addEventListener("input", () => {
+  const hasPinned = el("cdk-pinned").value.trim().length > 0;
+  const countLabel = el("cdk-count").closest("label");
+  if (countLabel) countLabel.style.display = hasPinned ? "none" : "";
+});
 el("cdk-list").addEventListener("click", async (ev) => {
   const target = ev.target;
   if (!target || typeof target.getAttribute !== "function") return;
   const copyCode = target.getAttribute("data-cdk-copy");
-  if (copyCode) { await copyText(copyCode); setCdkStatus("已复制卡密", "ok"); return; }
+  if (copyCode) {
+    await copyText(copyCode);
+    const origText = target.textContent; target.textContent = "已复制 ✓";
+    setTimeout(() => { target.textContent = origText; }, 1200);
+    setCdkStatus("已复制卡密", "ok");
+    setTimeout(() => setCdkStatus(""), 3000);
+    return;
+  }
   const viewMailboxesId = target.getAttribute("data-cdk-view-mailboxes");
   if (viewMailboxesId) {
     const res = await api(`/web/admin/cdks/${viewMailboxesId}/mailboxes`);
@@ -6673,29 +6825,34 @@ el("cdk-list").addEventListener("click", async (ev) => {
       res.data.redeemed ? `该卡密已绑定 ${boxes.length} 个邮箱` : "该卡密尚未被兑换，暂无绑定邮箱",
       res.data.redeemed ? "ok" : ""
     );
+    setTimeout(() => setCdkStatus(""), 4000);
     return;
   }
   const revokeId = target.getAttribute("data-cdk-revoke");
   if (revokeId) {
-    if (!confirm("确定撤销该卡密？撤销后无法兑换。")) return;
+    if (!(await confirmAction("确定撤销该卡密？撤销后无法兑换。"))) return;
     const res = await api(`/web/admin/cdks/${revokeId}/revoke`, { method: "POST", body: JSON.stringify({}) });
-    if (res.status === 200 && res.data.ok) { setCdkStatus("已撤销", "ok"); await refreshCdks(); }
+    if (res.status === 200 && res.data.ok) { setCdkStatus("已撤销", "ok"); setTimeout(() => setCdkStatus(""), 3000); await refreshCdks(); }
     else setCdkStatus(`撤销失败: ${res.data.error || "操作失败"}`, "error");
   }
 });
-el("cdk-search").oninput = () => refreshCdks(true);
+let cdkSearchTimer = null;
+el("cdk-search").oninput = () => { clearTimeout(cdkSearchTimer); cdkSearchTimer = setTimeout(() => refreshCdks(true), 300); };
 el("cdk-status-filter").onchange = () => refreshCdks(true);
 if (el("cdk-tag-filter")) el("cdk-tag-filter").onchange = () => refreshCdks(true);
 el("btn-refresh-stock").onclick = () => { refreshStats(); refreshStock(); };
+el("replace-address").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); el("btn-replace").click(); } });
 el("btn-replace").onclick = async () => {
   const address = el("replace-address").value.trim();
   if (!address) { el("replace-status").textContent = "请输入邮箱地址"; return; }
   el("replace-status").textContent = "换货中...";
   const res = await api("/web/admin/mailboxes/replace", { method: "POST", body: JSON.stringify({ address }) });
   if (res.status === 200 && res.data.ok) {
-    el("replace-status").textContent = "已换货，新邮箱凭据：" + res.data.credential;
+    const cred = res.data.credential || "";
+    el("replace-status").innerHTML = `已换货，新凭据：<code style="user-select:all;word-break:break-all">${escapeHtml(cred)}</code> <button type="button" id="replace-copy-btn" class="ghost" style="font-size:12px">复制凭据</button>`;
+    el("replace-copy-btn").onclick = async () => { await copyText(cred); el("replace-copy-btn").textContent = "已复制"; };
     el("replace-address").value = "";
-    refreshStats(); refreshStock();
+    refreshStats(); refreshStock(); if (typeof refreshCdks === "function") refreshCdks(true);
   } else {
     const map = { mailbox_not_found: "邮箱不存在", not_sold: "该邮箱未售出，无需换货", insufficient_stock: "同标签暂无可补发库存", missing_address: "请输入邮箱地址" };
     el("replace-status").textContent = "换货失败：" + (map[res.data.error] || res.data.error || "操作失败");
@@ -6709,6 +6866,7 @@ el("cdk-export").onclick = () => {
   const suffix = params.toString() ? `?${params.toString()}` : "";
   window.location.href = `/web/admin/cdks/export.txt${suffix}`;
 };
+el("cdk-first-page").onclick = () => { cdkPagination.offset = 0; refreshCdks(); };
 el("cdk-prev-page").onclick = () => {
   cdkPagination.offset = Math.max(0, cdkPagination.offset - cdkPagination.limit);
   refreshCdks();
@@ -6727,7 +6885,45 @@ el("cdk-next-page").onclick = () => {
   await refreshMailboxes();
   showView((location.hash || "#dashboard").slice(1));
 })();
+
+function promptNote(current) {
+  return new Promise((resolve) => {
+    const dlg = el("note-dlg");
+    el("note-dlg-input").value = current;
+    dlg.showModal();
+    const finish = (val) => { dlg.close(); resolve(val); };
+    el("note-dlg-ok").onclick = () => finish(el("note-dlg-input").value);
+    el("note-dlg-cancel").onclick = () => finish(null);
+    dlg.onclose = () => resolve(null);
+  });
+}
+function confirmAction(msg) {
+  return new Promise((resolve) => {
+    const dlg = el("admin-confirm-dlg");
+    el("admin-confirm-msg").textContent = msg;
+    dlg.showModal();
+    const finish = (v) => { dlg.close(); resolve(v); };
+    el("admin-confirm-ok").onclick = () => finish(true);
+    el("admin-confirm-cancel").onclick = () => finish(false);
+    dlg.onclose = () => resolve(false);
+  });
+}
 </script>
+<dialog id="note-dlg" style="border:1px solid var(--line); border-radius:12px; padding:20px 24px; min-width:320px; background:var(--surface); color:var(--text);">
+  <p style="margin:0 0 10px; font-weight:600;">编辑备注</p>
+  <input id="note-dlg-input" type="text" placeholder="留空即清除备注" style="width:100%; border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:14px; box-sizing:border-box;">
+  <div style="display:flex; gap:8px; justify-content:flex-end; margin-top:14px;">
+    <button id="note-dlg-cancel" type="button" class="ghost">取消</button>
+    <button id="note-dlg-ok" type="button" class="button-primary">确认</button>
+  </div>
+</dialog>
+<dialog id="admin-confirm-dlg" style="border:1px solid var(--line); border-radius:12px; padding:20px 24px; min-width:300px; background:var(--surface); color:var(--text);">
+  <p id="admin-confirm-msg" style="margin:0 0 14px; line-height:1.5;"></p>
+  <div style="display:flex; gap:8px; justify-content:flex-end;">
+    <button id="admin-confirm-cancel" type="button" class="ghost">取消</button>
+    <button id="admin-confirm-ok" type="button" class="button-primary">确认</button>
+  </div>
+</dialog>
 </body>
 </html>"""
 
