@@ -56,6 +56,7 @@ ICLOUD_FORWARD_ALIAS_ADDRESSES = {
     "icloud@52moyu.net",
     "icloud2@52moyu.net",
 }
+EXCLUSIVE_TAG_PREFIX = "exclusive:"
 SESSION_COOKIE_NAME = "mail_bridge_session"
 DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 LOGIN_MAX_FAILURES = 5
@@ -208,6 +209,10 @@ def setup_logger(log_dir: Path) -> logging.Logger:
 
 def normalize_address(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def is_exclusive_tag_name(value: Any) -> bool:
+    return normalize_address(value).startswith(EXCLUSIVE_TAG_PREFIX)
 
 
 def is_valid_email_address(value: Any) -> bool:
@@ -1677,8 +1682,22 @@ class MailBridgeStore:
                 ).fetchone()
             else:
                 repl = self._conn.execute(
-                    "SELECT id, address FROM mailbox_credentials WHERE status = 'available' AND active = 1 "
-                    "AND (pinned_cdk_id IS NULL OR pinned_cdk_id = 0) ORDER BY id ASC LIMIT 1"
+                    """
+                    SELECT mc.id AS id, mc.address AS address
+                    FROM mailbox_credentials mc
+                    WHERE mc.status = 'available' AND mc.active = 1
+                      AND (mc.pinned_cdk_id IS NULL OR mc.pinned_cdk_id = 0)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM mailbox_tag_links l
+                          INNER JOIN mailbox_tags mt ON mt.id = l.tag_id
+                          WHERE l.mailbox_id = mc.id
+                            AND lower(mt.name) LIKE ?
+                      )
+                    ORDER BY mc.id ASC
+                    LIMIT 1
+                    """,
+                    (f"{EXCLUSIVE_TAG_PREFIX}%",),
                 ).fetchone()
             if not repl:
                 return False, None, "insufficient_stock"
@@ -2063,10 +2082,17 @@ class MailBridgeStore:
                     FROM mailbox_credentials mc
                     WHERE mc.status = 'available' AND mc.active = 1
                       AND (mc.pinned_cdk_id IS NULL OR mc.pinned_cdk_id = 0)
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM mailbox_tag_links l
+                          INNER JOIN mailbox_tags mt ON mt.id = l.tag_id
+                          WHERE l.mailbox_id = mc.id
+                            AND lower(mt.name) LIKE ?
+                      )
                     ORDER BY mc.id ASC
                     LIMIT ?
                     """,
-                    (quantity,),
+                    (f"{EXCLUSIVE_TAG_PREFIX}%", quantity),
                 ).fetchall()
 
             if len(rows) < quantity:

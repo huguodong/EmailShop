@@ -1552,6 +1552,26 @@ class MailBridgeServerTests(unittest.TestCase):
         # Stock only moved by the one real dispense.
         self.assertEqual(self._tag_stock(self._stock(cookie), tag_id)["sold"], 1)
 
+    def test_any_cdk_skips_exclusive_tag_mailboxes(self) -> None:
+        store = self.server.app.store  # type: ignore[attr-defined]
+        ok, normal_tag, reason = store.create_mailbox_tag("normal")
+        self.assertTrue(ok, reason)
+        ok, exclusive_tag, reason = store.create_mailbox_tag("exclusive:clean50")
+        self.assertTrue(ok, reason)
+        summary = store.bulk_create_mailbox_credentials("exclusive@example.com", tag_ids=[exclusive_tag["id"]])
+        self.assertEqual(summary["created"], 1)
+        summary = store.bulk_create_mailbox_credentials("general@example.com", tag_ids=[normal_tag["id"]])
+        self.assertEqual(summary["created"], 1)
+        created = store.generate_cdk_codes(1, tag_id=exclusive_tag["id"], quantity=1, created_by=1)
+        self.assertTrue(created["ok"])
+        created = store.generate_cdk_codes(1, quantity=1, created_by=1)
+        self.assertTrue(created["ok"])
+        any_code = created["codes"][0]["code"]
+
+        status, body = self._redeem(any_code)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["mailboxes"][0]["address"], "general@example.com")
+
     def test_reredeem_claims_anonymous_mailbox_into_account(self) -> None:
         cookie = self._admin_cookie()
         tag_id = self._create_tag("outlook", cookie)
