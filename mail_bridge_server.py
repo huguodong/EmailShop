@@ -1243,16 +1243,20 @@ class MailBridgeStore:
 
         with self._lock:
             existing_rows = self._conn.execute(
-                f"SELECT address FROM mailbox_credentials WHERE address IN ({ph})",
+                f"SELECT address, status FROM mailbox_credentials WHERE address IN ({ph})",
                 all_addresses,
             ).fetchall()
-            existing_set = {row["address"] for row in existing_rows}
+            existing_status = {row["address"]: str(row["status"] or "") for row in existing_rows}
+            existing_set = set(existing_status)
 
             # New presale rows get a usable key up front (like the CSV import and
             # reset-key) so admins can copy a working credential immediately.
             new_rows = [(addr, generate_access_key(), clean_note, now, now) for _, _, addr in valid_items if addr not in existing_set]
-            # ponytail: generate_access_key per existing address — same behaviour as reset_mailbox_access_key
-            reset_rows = [(generate_access_key(), now, addr) for _, _, addr in valid_items if addr in existing_set]
+            # Refresh the key of existing NON-sold stock only. Rotating a sold mailbox's
+            # key would silently invalidate the buyer's saved `address----key`, locking
+            # them out — so a sold address in a re-imported list is left untouched.
+            reset_rows = [(generate_access_key(), now, addr) for _, _, addr in valid_items
+                          if addr in existing_set and existing_status.get(addr) != "sold"]
 
             if new_rows:
                 self._conn.executemany(
@@ -1260,8 +1264,19 @@ class MailBridgeStore:
                     new_rows,
                 )
             if reset_rows:
+                # Same resurrection rule as the CSV import (see #62): a re-imported
+                # address that was soft-deleted or replaced (dead) must return to
+                # sellable presale stock with ownership cleared, not linger in a
+                # contradictory active=1 + status='deleted'/'dead' state. sold/
+                # available/presale keep their status. SQLite reads OLD row values
+                # for every SET expression, so each CASE sees the pre-update status.
                 self._conn.executemany(
-                    "UPDATE mailbox_credentials SET access_key = ?, active = 1, updated_at = ? WHERE address = ?",
+                    "UPDATE mailbox_credentials SET access_key = ?, active = 1, updated_at = ?, "
+                    "status = CASE WHEN status IN ('deleted','dead') THEN 'presale' ELSE status END, "
+                    "owner_user_id = CASE WHEN status IN ('deleted','dead') THEN 0 ELSE owner_user_id END, "
+                    "sold_at = CASE WHEN status IN ('deleted','dead') THEN '' ELSE sold_at END, "
+                    "order_id = CASE WHEN status IN ('deleted','dead') THEN 0 ELSE order_id END "
+                    "WHERE address = ?",
                     reset_rows,
                 )
             self._conn.commit()
@@ -1273,14 +1288,24 @@ class MailBridgeStore:
             result_map = {row["address"]: row for row in fetched}
 
             if normalized_tag_ids and result_map:
-                for row in result_map.values():
-                    mid = int(row["id"])
-                    self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
-                    self._conn.executemany(
-                        "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
-                        [(mid, tid) for tid in normalized_tag_ids],
-                    )
-                self._conn.commit()
+                # 只链接库中真实存在的 tag，杜绝悬挂 link（不存在的 tag_id 会让邮箱在
+                # 按 tag 库存分类里既不属任何标签也不算无标签，导致分类少算）。set_mailbox_tags
+                # 已做等价校验，这里两条批量路径对齐。
+                ph = ",".join("?" for _ in normalized_tag_ids)
+                valid_tag_ids = [
+                    int(r["id"]) for r in self._conn.execute(
+                        f"SELECT id FROM mailbox_tags WHERE id IN ({ph})", tuple(normalized_tag_ids)
+                    ).fetchall()
+                ]
+                if valid_tag_ids:
+                    for row in result_map.values():
+                        mid = int(row["id"])
+                        self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
+                        self._conn.executemany(
+                            "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
+                            [(mid, tid) for tid in valid_tag_ids],
+                        )
+                    self._conn.commit()
 
         created = 0
         reset = 0
@@ -1376,8 +1401,21 @@ class MailBridgeStore:
             ]
 
             if update_rows:
+                # Re-importing an address that was soft-deleted or replaced (dead)
+                # must resurrect it to sellable presale stock and clear stale
+                # ownership — otherwise it lands in a contradictory active=1 +
+                # status='deleted'/'dead' state, invisible to every stock query
+                # while the admin sees "updated". sold/available/presale are left
+                # untouched so a live buyer's mailbox is never reset. SQLite reads
+                # the OLD row values for all SET expressions, so every CASE sees
+                # the pre-update status.
                 self._conn.executemany(
-                    "UPDATE mailbox_credentials SET access_key = ?, note = ?, active = 1, updated_at = ? WHERE id = ?",
+                    "UPDATE mailbox_credentials SET access_key = ?, note = ?, active = 1, updated_at = ?, "
+                    "status = CASE WHEN status IN ('deleted','dead') THEN 'presale' ELSE status END, "
+                    "owner_user_id = CASE WHEN status IN ('deleted','dead') THEN 0 ELSE owner_user_id END, "
+                    "sold_at = CASE WHEN status IN ('deleted','dead') THEN '' ELSE sold_at END, "
+                    "order_id = CASE WHEN status IN ('deleted','dead') THEN 0 ELSE order_id END "
+                    "WHERE id = ?",
                     update_rows,
                 )
             if insert_rows:
@@ -1394,14 +1432,24 @@ class MailBridgeStore:
             result_map = {row["address"]: row for row in fetched}
 
             if normalized_tag_ids and result_map:
-                for row in result_map.values():
-                    mid = int(row["id"])
-                    self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
-                    self._conn.executemany(
-                        "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
-                        [(mid, tid) for tid in normalized_tag_ids],
-                    )
-                self._conn.commit()
+                # 只链接库中真实存在的 tag，杜绝悬挂 link（不存在的 tag_id 会让邮箱在
+                # 按 tag 库存分类里既不属任何标签也不算无标签，导致分类少算）。set_mailbox_tags
+                # 已做等价校验，这里两条批量路径对齐。
+                ph = ",".join("?" for _ in normalized_tag_ids)
+                valid_tag_ids = [
+                    int(r["id"]) for r in self._conn.execute(
+                        f"SELECT id FROM mailbox_tags WHERE id IN ({ph})", tuple(normalized_tag_ids)
+                    ).fetchall()
+                ]
+                if valid_tag_ids:
+                    for row in result_map.values():
+                        mid = int(row["id"])
+                        self._conn.execute("DELETE FROM mailbox_tag_links WHERE mailbox_id = ?", (mid,))
+                        self._conn.executemany(
+                            "INSERT OR IGNORE INTO mailbox_tag_links (mailbox_id, tag_id) VALUES (?, ?)",
+                            [(mid, tid) for tid in valid_tag_ids],
+                        )
+                    self._conn.commit()
 
         created = 0
         updated = 0
@@ -1473,10 +1521,13 @@ class MailBridgeStore:
         if not row:
             return False, None, "invalid_credential"
         record = self._mailbox_record_from_row(row)
-        if not record.active:
-            return False, None, "mailbox_inactive"
+        # 先校验密钥再判 active：否则密钥错误时 inactive 地址回 mailbox_inactive、
+        # 其余回 invalid_credential，泄漏「地址存在但已停用」的枚举 oracle。
+        # 密钥错一律 invalid_credential，只有持正确密钥的合法主人才看到 mailbox_inactive。
         if not secrets.compare_digest(record.access_key, raw_key):
             return False, None, "invalid_credential"
+        if not record.active:
+            return False, None, "mailbox_inactive"
         return True, record, "ok"
 
     def reset_mailbox_access_key(self, mailbox_id: int) -> tuple[bool, Optional[MailboxCredentialRecord], str]:
@@ -1618,6 +1669,7 @@ class MailBridgeStore:
                     """
                     SELECT mc.id AS id, mc.address AS address FROM mailbox_credentials mc
                     WHERE mc.status = 'available' AND mc.active = 1
+                      AND (mc.pinned_cdk_id IS NULL OR mc.pinned_cdk_id = 0)
                       AND EXISTS (SELECT 1 FROM mailbox_tag_links l WHERE l.mailbox_id = mc.id AND l.tag_id = ?)
                     ORDER BY mc.id ASC LIMIT 1
                     """,
@@ -1625,7 +1677,8 @@ class MailBridgeStore:
                 ).fetchone()
             else:
                 repl = self._conn.execute(
-                    "SELECT id, address FROM mailbox_credentials WHERE status = 'available' AND active = 1 ORDER BY id ASC LIMIT 1"
+                    "SELECT id, address FROM mailbox_credentials WHERE status = 'available' AND active = 1 "
+                    "AND (pinned_cdk_id IS NULL OR pinned_cdk_id = 0) ORDER BY id ASC LIMIT 1"
                 ).fetchone()
             if not repl:
                 return False, None, "insufficient_stock"
@@ -1658,6 +1711,29 @@ class MailBridgeStore:
                     "INSERT OR IGNORE INTO user_mailboxes (user_id, address, created_at) VALUES (?, ?, ?)",
                     (owner_user_id, new_address, now),
                 )
+            # 同步换货到订单流水：把 cdk_redemptions 里的旧地址/旧 id 换成新的，
+            # 否则买家清缓存后用原 CDK 找回会拿回已作废的旧邮箱（reissue 读的是 addresses）。
+            # 内联 SQL（全局锁不可重入）。
+            if order_id > 0:
+                red = self._conn.execute(
+                    "SELECT addresses, mailbox_ids FROM cdk_redemptions WHERE id = ? LIMIT 1",
+                    (order_id,),
+                ).fetchone()
+                if red:
+                    try:
+                        addrs = json.loads(red["addresses"] or "[]")
+                    except Exception:
+                        addrs = []
+                    try:
+                        mids = json.loads(red["mailbox_ids"] or "[]")
+                    except Exception:
+                        mids = []
+                    addrs = [new_address if a == normalized else a for a in addrs]
+                    mids = [new_id if int(i or 0) == old_id else i for i in mids]
+                    self._conn.execute(
+                        "UPDATE cdk_redemptions SET addresses = ?, mailbox_ids = ? WHERE id = ?",
+                        (json.dumps(addrs), json.dumps(mids), order_id),
+                    )
             fresh = self._conn.execute(
                 """
                 SELECT id, address, access_key, active, note, created_at, updated_at
@@ -1686,7 +1762,12 @@ class MailBridgeStore:
         pinned_addresses: list = [],
     ) -> dict[str, Any]:
         # Pinned mode: one CDK per specified address, ignoring count/tag/quantity.
-        clean_pinned = [str(a).strip() for a in (pinned_addresses or []) if str(a).strip()]
+        # normalize_address (strip+lower) so a mailbox typed with any uppercase still
+        # matches the stored (always-lowercased) address instead of silently skipping.
+        # De-dup while preserving order so the same address can't be double-processed.
+        clean_pinned = list(dict.fromkeys(
+            normalize_address(a) for a in (pinned_addresses or []) if normalize_address(a)
+        ))
         if clean_pinned:
             now = utcnow_iso()
             clean_label = str(batch_label or "").strip()
@@ -1696,10 +1777,15 @@ class MailBridgeStore:
             with self._lock:
                 for address in clean_pinned:
                     row = self._conn.execute(
-                        "SELECT id, status FROM mailbox_credentials WHERE address = ? AND active = 1 LIMIT 1",
+                        "SELECT id, status, pinned_cdk_id FROM mailbox_credentials WHERE address = ? AND active = 1 LIMIT 1",
                         (address,),
                     ).fetchone()
+                    # Skip if missing, already sold, or already reserved by another pinned
+                    # CDK — re-pinning would overwrite pinned_cdk_id and orphan the earlier
+                    # code (its buyer could never redeem the now-repointed mailbox).
                     if not row or str(row["status"] or "") == "sold":
+                        continue
+                    if int(row["pinned_cdk_id"] or 0) > 0:
                         continue
                     mailbox_id = int(row["id"])
                     code = ""
@@ -1880,8 +1966,6 @@ class MailBridgeStore:
             ).fetchone()
             if not cdk:
                 return False, None, "cdk_not_found"
-            if int(cdk["active"] or 0) != 1:
-                return False, None, "cdk_disabled"
 
             cdk_id = int(cdk["id"] or 0)
             tag_id = int(cdk["tag_id"] or 0)
@@ -1901,17 +1985,23 @@ class MailBridgeStore:
                 bound = [a for a in json.loads(prior["addresses"] or "[]") if a]
                 if clean_user_id > 0:
                     for address in bound:
-                        # Claim if currently unowned (e.g. first redeemed anonymously),
-                        # and always surface in this buyer's dashboard.
+                        # Claim if currently unowned (e.g. first redeemed anonymously).
                         self._conn.execute(
                             "UPDATE mailbox_credentials SET owner_user_id = ?, "
                             "sold_at = CASE WHEN sold_at IS NULL OR sold_at = '' THEN ? ELSE sold_at END, "
                             "updated_at = ? WHERE address = ? AND (owner_user_id IS NULL OR owner_user_id = 0)",
                             (clean_user_id, now, now, address),
                         )
+                        # Surface in the dashboard ONLY if this user actually owns it now
+                        # (just claimed, or already theirs). If another account owns it,
+                        # binding it here would fork the two ownership sources — owner_user_id
+                        # says the other user, user_mailboxes would say both — letting a second
+                        # account read the owner's mail while only the owner can reset/delete.
                         self._conn.execute(
-                            "INSERT OR IGNORE INTO user_mailboxes (user_id, address, created_at) VALUES (?, ?, ?)",
-                            (clean_user_id, address, now),
+                            "INSERT OR IGNORE INTO user_mailboxes (user_id, address, created_at) "
+                            "SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM mailbox_credentials "
+                            "WHERE address = ? AND owner_user_id = ?)",
+                            (clean_user_id, address, now, address, clean_user_id),
                         )
                 reissue_ph = ",".join("?" for _ in bound) or "NULL"
                 dispensed = self._conn.execute(
@@ -1933,6 +2023,9 @@ class MailBridgeStore:
                 ]
                 return True, {"redemption_id": 0, "quantity": len(mailboxes), "mailboxes": mailboxes, "reused": True}, "ok"
 
+            # 以下为「首次发货」路径：撤销/过期/用尽只挡新兑换，不影响上面已付款买家的幂等找回。
+            if int(cdk["active"] or 0) != 1:
+                return False, None, "cdk_disabled"
             if int(cdk["used_count"] or 0) >= int(cdk["max_uses"] or 1):
                 return False, None, "cdk_used"
             expires_at = str(cdk["expires_at"] or "")
@@ -2090,13 +2183,16 @@ class MailBridgeStore:
         if clean_tag_id > 0:
             where.append("c.tag_id = ?")
             params.append(clean_tag_id)
+        # Filter buckets must be MUTUALLY EXCLUSIVE and match the per-card badge
+        # priority below (disabled > used > expired > active), or a code shows up
+        # under a filter whose label contradicts its badge and the counts overlap.
         if clean_status == "active":
             where.append("c.active = 1 AND c.used_count < c.max_uses AND (c.expires_at = '' OR c.expires_at > ?)")
             params.append(now)
         elif clean_status == "used":
-            where.append("c.used_count >= c.max_uses")
+            where.append("c.active = 1 AND c.used_count >= c.max_uses")
         elif clean_status == "expired":
-            where.append("c.expires_at != '' AND c.expires_at <= ?")
+            where.append("c.active = 1 AND c.used_count < c.max_uses AND c.expires_at != '' AND c.expires_at <= ?")
             params.append(now)
         elif clean_status == "disabled":
             where.append("c.active = 0")
@@ -2106,6 +2202,13 @@ class MailBridgeStore:
             total = int(
                 self._conn.execute(
                     f"SELECT COUNT(*) FROM cdks c {where_sql}", tuple(params)
+                ).fetchone()[0]
+                or 0
+            )
+            # 全量兑换次数（used_count 之和），供仪表盘精确统计，不受分页 limit 影响
+            total_used = int(
+                self._conn.execute(
+                    f"SELECT COALESCE(SUM(c.used_count), 0) FROM cdks c {where_sql}", tuple(params)
                 ).fetchone()[0]
                 or 0
             )
@@ -2151,7 +2254,7 @@ class MailBridgeStore:
                     "created_at": str(row["created_at"] or ""),
                 }
             )
-        return items, total
+        return items, total, total_used
 
     def set_cdk_active(self, cdk_id: int, active: bool) -> tuple[bool, str]:
         clean_id = int(cdk_id or 0)
@@ -2162,6 +2265,17 @@ class MailBridgeStore:
                 "UPDATE cdks SET active = ? WHERE id = ?",
                 (1 if active else 0, clean_id),
             )
+            if not active and int(cursor.rowcount or 0) > 0:
+                # Revoking a pinned CDK must free its still-unsold reservations back to
+                # normal stock, or they stay status='available' + pinned_cdk_id=<this>
+                # forever: the pinned code can no longer redeem (active=0) and every
+                # other redeem/replace path excludes pinned rows — undeliverable zombies.
+                # Sold rows are left alone (status='sold' keeps them out of stock queries).
+                self._conn.execute(
+                    "UPDATE mailbox_credentials SET pinned_cdk_id = 0, updated_at = ? "
+                    "WHERE pinned_cdk_id = ? AND status = 'available'",
+                    (utcnow_iso(), clean_id),
+                )
             self._conn.commit()
         if int(cursor.rowcount or 0) <= 0:
             return False, "cdk_not_found"
@@ -2447,6 +2561,20 @@ class MailBridgeStore:
             exists = self._conn.execute("SELECT id FROM mailbox_tags WHERE id = ? LIMIT 1", (clean_tag_id,)).fetchone()
             if not exists:
                 return False, "tag_not_found"
+            # 删除标签会连带删掉其 mailbox_tag_links，仍绑定该 tag 的可兑换 CDK 会因
+            # 「按 tag 找库存」永远 EXISTS 为空而 insufficient_stock，买家付款兑不出（同 #64 僵尸）。
+            # 拒删仍可首次发货的绑定 CDK（active 且未用尽且未过期），逼管理员先撤销/改品类。
+            now = utcnow_iso()
+            in_use = self._conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM cdks
+                WHERE tag_id = ? AND active = 1 AND used_count < max_uses
+                  AND (expires_at = '' OR expires_at > ?)
+                """,
+                (clean_tag_id, now),
+            ).fetchone()
+            if int((in_use["n"] if in_use else 0) or 0) > 0:
+                return False, "tag_in_use"
             self._conn.execute("DELETE FROM mailbox_tag_links WHERE tag_id = ?", (clean_tag_id,))
             self._conn.execute("DELETE FROM mailbox_tags WHERE id = ?", (clean_tag_id,))
             self._conn.commit()
@@ -2543,20 +2671,29 @@ class MailBridgeStore:
         now = utcnow_iso()
         with self._lock:
             row = self._conn.execute(
-                "SELECT access_key FROM mailbox_credentials WHERE id = ? LIMIT 1", (clean_id,)
+                "SELECT access_key, address FROM mailbox_credentials WHERE id = ? LIMIT 1", (clean_id,)
             ).fetchone()
             if not row:
                 return False, "mailbox_not_found"
             if clean_status == "available":
                 key = str(row["access_key"] or "") or generate_access_key()
                 self._conn.execute(
-                    "UPDATE mailbox_credentials SET status='available', active=1, access_key=?, owner_user_id=0, sold_at='', order_id=0, updated_at=? WHERE id=?",
+                    "UPDATE mailbox_credentials SET status='available', active=1, access_key=?, owner_user_id=0, sold_at='', order_id=0, pinned_cdk_id=0, updated_at=? WHERE id=?",
                     (key, now, clean_id),
+                )
+                # Ownership is double-tracked (owner_user_id + user_mailboxes). Moving a
+                # sold mailbox back to sellable stock must drop the old buyer's link too,
+                # or after it is resold the previous buyer still sees/reads it (cross-owner leak).
+                self._conn.execute(
+                    "DELETE FROM user_mailboxes WHERE address = ?", (str(row["address"] or ""),)
                 )
             elif clean_status == "presale":
                 self._conn.execute(
-                    "UPDATE mailbox_credentials SET status='presale', active=1, owner_user_id=0, sold_at='', order_id=0, updated_at=? WHERE id=?",
+                    "UPDATE mailbox_credentials SET status='presale', active=1, owner_user_id=0, sold_at='', order_id=0, pinned_cdk_id=0, updated_at=? WHERE id=?",
                     (now, clean_id),
+                )
+                self._conn.execute(
+                    "DELETE FROM user_mailboxes WHERE address = ?", (str(row["address"] or ""),)
                 )
             elif clean_status == "deleted":
                 self._conn.execute(
@@ -2783,6 +2920,17 @@ class MailBridgeStore:
             ).fetchone()
             if not existing_user:
                 return False, "user_not_found"
+            # 守卫：不给不存在/已删/已作废的地址插幽灵链接；不给已归属他人的邮箱再插链接
+            # （否则被指派者能读原主邮件——与 #66 同类的跨用户读信分叉）。
+            mb = self._conn.execute(
+                "SELECT status, active, owner_user_id FROM mailbox_credentials WHERE address = ? LIMIT 1",
+                (normalized_address,),
+            ).fetchone()
+            if not mb or str(mb["status"] or "") in ("deleted", "dead") or not int(mb["active"] or 0):
+                return False, "mailbox_not_found"
+            owner = int(mb["owner_user_id"] or 0)
+            if owner and owner != int(user_id):
+                return False, "mailbox_owned_by_other"
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO user_mailboxes (user_id, address, created_at)
@@ -3103,6 +3251,11 @@ class MailBridgeApplication:
         self.session_secret = str(session_secret or "").strip() or self.api_token or "CHANGE_ME_SESSION_SECRET"
         self.login_limiter = RateLimiter(LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS)
         self.redeem_limiter = RateLimiter(REDEEM_MAX_FAILURES, REDEEM_WINDOW_SECONDS)
+        # 注册也是公开端点且每次触发昂贵 PBKDF2 + 写库，复用登录阈值节流防刷号/CPU-DoS。
+        self.register_limiter = RateLimiter(LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS)
+        # 公共取件（query-mails / query-mail-detail）凭 地址----密钥 校验，地址即售卖产品易枚举，
+        # access_key 是保护买家邮箱与验证码的唯一秘密，须防暴力试 key（仅失败累计，成功即 reset）。
+        self.query_limiter = RateLimiter(LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS)
 
     def check_bearer(self, raw_header: str, expected_token: str) -> bool:
         token = str(raw_header or "").strip()
@@ -3237,11 +3390,16 @@ class MailBridgeHandler(BaseHTTPRequestHandler):
         return str(morsel.value or "").strip()
 
     def _client_ip(self) -> str:
-        # Honor the first X-Forwarded-For hop when behind a reverse proxy,
-        # otherwise the direct peer address.
+        # 取 X-Forwarded-For 的**最后一跳**（可信反代追加的真实 peer），不是第一跳：
+        # 标准反代（nginx $proxy_add_x_forwarded_for）把真实客户端 IP 追加到 XFF 末尾，
+        # 最左段完全由客户端伪造。若取第一跳，攻击者每请求换个 XFF 前缀即得到不同限流 key，
+        # 绕过 login/register/query/redeem 全部限流。本服务绑 127.0.0.1，必在反代后，取末尾安全。
+        # ponytail: 假设单层可信反代且追加 XFF；多层链路需按可信跳数从右数，YAGNI。
         forwarded = str(self.headers.get("X-Forwarded-For") or "").strip()
         if forwarded:
-            return forwarded.split(",")[0].strip()
+            last_hop = forwarded.split(",")[-1].strip()
+            if last_hop:
+                return last_hop
         return self.client_address[0] if self.client_address else "?"
 
     def _current_session_user(self) -> Optional[dict[str, Any]]:
@@ -3840,7 +3998,7 @@ el("login-form").onsubmit = async (ev) => {
             <button type="button" id="viewRawButton" class="modal-switch">邮件源码</button>
           </div>
           <div style="margin-top:14px">
-            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
+            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
             <pre id="emailBodyFallback" class="modal-fallback"></pre>
           </div>
         </div>
@@ -4013,6 +4171,7 @@ async function queryMails(silent) {
       setTimeout(() => setStatus(""), 4000);
     } else if (!silent) {
       setStatus("查询成功", "ok");
+      setTimeout(() => { if (el("messageArea").textContent === "查询成功") setStatus(""); }, 3000);
     }
     lastTopMailId = topId;
     return;
@@ -4155,7 +4314,10 @@ function renderMyMailboxes() {
   const all = loadMailboxes();
   if (!all.length) { panel.style.display = "none"; box.innerHTML = ""; if (searchEl) searchEl.style.display = "none"; return; }
   panel.style.display = "";
-  if (searchEl) searchEl.style.display = all.length > 4 ? "" : "none";
+  if (searchEl) {
+    if (all.length > 4) { searchEl.style.display = ""; }
+    else { searchEl.style.display = "none"; searchEl.value = ""; }  // 隐藏时清空，避免残留搜索词误过滤
+  }
   const q = searchEl ? searchEl.value.trim().toLowerCase() : "";
   const list = q ? all.filter((m) => m.address.toLowerCase().includes(q)) : all;
   box.innerHTML = list.length ? list.map((m) => `
@@ -4469,7 +4631,7 @@ renderMyMailboxes();
             <button type="button" id="viewRawButton" class="modal-switch secondary">纯文本</button>
           </div>
           <div style="margin-top:14px">
-            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
+            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
             <pre id="emailBodyFallback" class="modal-fallback"></pre>
           </div>
         </div>
@@ -4504,6 +4666,12 @@ async function api(path, opts = {}) {
   const text = await r.text();
   let data = {};
   try { data = JSON.parse(text || "{}"); } catch {}
+  // 会话过期兜底：仪表盘可见时收到 401 说明登录已失效，停掉自动刷新并退回登录页
+  if (r.status === 401 && el("dash") && el("dash").style.display !== "none") {
+    stopInboxAutoRefresh();
+    showAuth();
+    setAuthStatus("登录已过期，请重新登录", "error");
+  }
   return { status: r.status, data };
 }
 function el(id) { return document.getElementById(id); }
@@ -5021,6 +5189,7 @@ el("btn-auth-submit").onclick = async () => {
   const button = el("btn-auth-submit");
   button.disabled = true;
   if (authMode === "register") {
+    if (password.length < 6) { setAuthStatus("密码至少 6 位", "error"); button.disabled = false; return; }
     setAuthStatus("注册中...", "");
     const reg = await api("/web/auth/register", { method: "POST", body: JSON.stringify({ username, password }) });
     if (!(reg.status === 200 && reg.data.ok)) {
@@ -5040,6 +5209,8 @@ el("btn-auth-submit").onclick = async () => {
   }
   button.disabled = false;
 };
+
+["auth-user", "auth-pass"].forEach((id) => el(id).addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); el("btn-auth-submit").click(); } }));
 
 function showAuth() {
   el("auth-gate").style.display = "";
@@ -5280,7 +5451,7 @@ boot();
           <div class="panel-body">
             <div class="stat-grid">
               <div class="stat-card"><span class="stat-label">邮箱总数</span><strong id="stat-mailboxes" class="stat-value">-</strong></div>
-              <div class="stat-card"><span class="stat-label">启用邮箱</span><strong id="stat-active" class="stat-value">-</strong></div>
+              <div class="stat-card"><span class="stat-label">可发货</span><strong id="stat-active" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">已售邮箱</span><strong id="stat-sold" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">标签数</span><strong id="stat-tags" class="stat-value">-</strong></div>
               <div class="stat-card"><span class="stat-label">收件总数</span><strong id="stat-inbox" class="stat-value">-</strong></div>
@@ -5620,7 +5791,7 @@ boot();
             <button type="button" id="viewRawButton" class="modal-switch secondary">邮件源码</button>
           </div>
           <div style="margin-top:14px">
-            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文"></iframe>
+            <iframe id="emailBodyFrame" src="about:blank" title="邮件正文" sandbox="allow-popups allow-popups-to-escape-sandbox"></iframe>
             <pre id="emailBodyFallback" class="modal-fallback"></pre>
           </div>
         </div>
@@ -5662,11 +5833,18 @@ boot();
     </div>
   </div>
 <script>
+let sessionExpiredHandled = false;
 async function api(path, opts = {}) {
   const r = await fetch(path, { credentials: "include", headers: { "Content-Type": "application/json" }, ...opts });
   const text = await r.text();
   let data = {};
   try { data = JSON.parse(text || "{}"); } catch {}
+  // 会话过期兜底：管理后台收到 401 说明登录已失效，退回登录页（一次性，避免并发 401 重复跳转）
+  if (r.status === 401 && !sessionExpiredHandled) {
+    sessionExpiredHandled = true;
+    alert("登录已过期，请重新登录");
+    location.href = "/web/query";
+  }
   return { status: r.status, data };
 }
 function el(id) { return document.getElementById(id); }
@@ -5713,11 +5891,15 @@ function formatDateOnly(value) {
   return text;
 }
 
+let adminStatusTimer = null;
 function setStatus(text, kind = "") {
   const node = el("status");
   node.textContent = text;
   node.classList.remove("ok", "error");
   if (kind) node.classList.add(kind);
+  clearTimeout(adminStatusTimer);
+  // ponytail: 成功提示 3.5s 后自动清空，错误/进行中提示保留直到下一次操作
+  if (kind === "ok" && text) adminStatusTimer = setTimeout(() => setStatus(""), 3500);
 }
 
 function closeTagEditModal() {
@@ -6193,8 +6375,17 @@ el("btn-gen-cdk-from-mb").onclick = async () => {
     return;
   }
   const codes = (res.data.codes || []).map(c => c.code);
+  // Pinned generation silently skips addresses already sold / reserved by another
+  // pinned code — report how many of the selected rows were dropped (#72/#73).
+  const skipped = addresses.length - codes.length;
+  if (!codes.length) {
+    statusEl.textContent = `未生成任何卡密：${skipped} 个所选邮箱已售或已被其他专属码预留`;
+    return;
+  }
   await copyText(codes.join("\n"));
-  statusEl.textContent = `已生成并复制 ${codes.length} 个卡密`;
+  statusEl.textContent = skipped > 0
+    ? `已生成并复制 ${codes.length} 个专属卡密；${skipped} 个所选邮箱被跳过（已售/已被其他专属码预留）`
+    : `已生成并复制 ${codes.length} 个卡密`;
   selectedAdminMailboxes.clear();
   renderMailboxesTable();
   updateAdminMailboxBatchBar();
@@ -6286,7 +6477,7 @@ document.addEventListener("click", async (ev) => {
     return;
   }
   if (action === "delete") {
-    if (!confirm(`确定删除邮箱「${mailbox.address}」？\n将标记为「已删除」并从列表隐藏（可按状态筛选「已删除」查看），不会真正清除数据。`)) return;
+    if (!(await confirmAction(`确定删除邮箱「${mailbox.address}」？\n将标记为「已删除」并从列表隐藏（可按状态筛选「已删除」查看），不会真正清除数据。`))) return;
     const res = await api(`/web/admin/mailboxes/${id}/delete`, { method: "POST", body: JSON.stringify({}) });
     setResult(res.data);
     setStatus(res.status === 200 && res.data.ok ? "邮箱已删除" : `删除失败: ${res.data.error || "操作失败"}`, res.status === 200 && res.data.ok ? "ok" : "error");
@@ -6382,11 +6573,14 @@ document.addEventListener("click", async (ev) => {
   const target = ev.target;
   const tagId = target && target.dataset ? target.dataset.tagDelete : "";
   if (!tagId) return;
-  const confirmed = confirm("删除该标签后，会从所有邮箱上移除，确定继续吗？");
-  if (!confirmed) return;
+  if (!(await confirmAction("删除该标签后，会从所有邮箱上移除，确定继续吗？"))) return;
   const res = await api(`/web/admin/tags/${tagId}/delete`, { method: "POST", body: JSON.stringify({}) });
   setResult(res.data);
-  setStatus(res.status === 200 && res.data.ok ? "标签已删除" : `标签删除失败: ${res.data.error || "操作失败"}`, res.status === 200 && res.data.ok ? "ok" : "error");
+  const ok = res.status === 200 && res.data.ok;
+  const tagErr = res.data.error === "tag_in_use"
+    ? "该品类下仍有可用卡密绑定，请先撤销这些卡密或改绑其他品类后再删除"
+    : (res.data.error || "操作失败");
+  setStatus(ok ? "标签已删除" : `标签删除失败: ${tagErr}`, ok ? "ok" : "error");
   await refreshTags();
   await refreshMailboxes(true);
 });
@@ -6416,6 +6610,11 @@ el("btn-save-tag-modal").onclick = async () => {
 };
 el("tagEditModal").addEventListener("click", (ev) => {
   if (ev.target === el("tagEditModal")) closeTagEditModal();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  if (el("tagEditModal").classList.contains("open")) closeTagEditModal();
+  else if (el("mailboxMailsModal").classList.contains("open")) closeMailboxMails();
 });
 
 // ---- 收件箱视图（合并自原 /web/admin/inbox 页面）----
@@ -6589,25 +6788,27 @@ el("emailModal").addEventListener("click", (ev) => {
 // ---- 概览视图 ----
 let dashboardLoaded = false;
 async function loadDashboard() {
-  const [mb, ib, cdk] = await Promise.all([
-    api("/web/admin/mailboxes?limit=200"),
+  const [stats, ib, cdk] = await Promise.all([
+    api("/web/admin/stats"),
     api("/web/admin/inbox/list?limit=1"),
     api("/web/admin/cdks?limit=200"),
   ]);
-  if (mb.status === 200 && mb.data.ok) {
-    const list = mb.data.mailboxes || [];
-    el("stat-mailboxes").textContent = String(mb.data.total != null ? mb.data.total : list.length);
-    // ponytail: 启用数/已售数统计前 200 个邮箱即可，精确全量统计需后端再加聚合接口
-    el("stat-active").textContent = String(list.filter((m) => m.active).length);
-    el("stat-sold").textContent = String(list.filter((m) => m.status === "sold").length);
+  // 用后端 sales_stats 的 SQL 全量聚合作权威源（total/可发货/已售均精确，不受分页采样影响）
+  if (stats.status === 200 && stats.data.ok && stats.data.stats) {
+    const s = stats.data.stats;
+    el("stat-mailboxes").textContent = String(s.total || 0);
+    el("stat-active").textContent = String(s.available || 0);  // 可发货 = status='available' AND active=1
+    el("stat-sold").textContent = String(s.sold || 0);
   }
   el("stat-tags").textContent = String(tagCache.length);
   if (ib.status === 200 && ib.data.ok) {
     el("stat-inbox").textContent = String(ib.data.total != null ? ib.data.total : 0);
   }
   if (cdk.status === 200 && cdk.data.ok) {
+    // 后端返回全量 total_used（SUM(used_count)），不受分页 limit 影响；兜底用前 200 求和
     const cdks = cdk.data.cdks || [];
-    el("stat-cdk-redeems").textContent = String(cdks.reduce((s, c) => s + (c.used_count || 0), 0));
+    const totalUsed = cdk.data.total_used != null ? cdk.data.total_used : cdks.reduce((s, c) => s + (c.used_count || 0), 0);
+    el("stat-cdk-redeems").textContent = String(totalUsed);
   }
   dashboardLoaded = true;
 }
@@ -6716,6 +6917,14 @@ async function refreshCdks(resetOffset) {
   cdkPagination.keyword = el("cdk-search").value.trim();
   cdkPagination.status = el("cdk-status-filter").value;
   cdkPagination.tagId = (el("cdk-tag-filter") && el("cdk-tag-filter").value) || "";
+  // 筛选激活时高亮下拉框，提醒用户当前存在过滤条件
+  ["cdk-status-filter", "cdk-tag-filter"].forEach((id) => {
+    const sel = el(id); if (!sel) return;
+    const active = !!sel.value;
+    sel.style.borderColor = active ? "var(--accent, #2563eb)" : "";
+    sel.style.background = active ? "rgba(37,99,235,0.08)" : "";
+    sel.style.fontWeight = active ? "600" : "";
+  });
   const params = new URLSearchParams({ limit: String(cdkPagination.limit), offset: String(cdkPagination.offset) });
   if (cdkPagination.keyword) params.set("keyword", cdkPagination.keyword);
   if (cdkPagination.status) params.set("status", cdkPagination.status);
@@ -6765,7 +6974,16 @@ el("btn-gen-cdk").onclick = async () => {
   const batch = el("cdk-batch").value.trim();
   const note = el("cdk-note").value.trim();
   let expires = el("cdk-expires").value.trim();
-  if (expires) { try { expires = new Date(expires).toISOString(); } catch { expires = ""; } }
+  if (expires) {
+    const d = new Date(expires);
+    if (isNaN(d.getTime())) { expires = ""; }
+    else if (d.getTime() <= Date.now()) {
+      // 过期时间在过去 → CDK 一生成即失效，拦截并提醒，避免管理员手滑造出死码
+      setCdkStatus("有效期不能早于当前时间，请重新设置或清除", "error");
+      button.disabled = false;
+      return;
+    } else { expires = d.toISOString(); }
+  }
   const pinnedRaw = el("cdk-pinned") ? el("cdk-pinned").value.trim() : "";
   const pinnedAddresses = pinnedRaw ? pinnedRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean) : [];
   setCdkStatus("生成中...", "");
@@ -6783,13 +7001,24 @@ el("btn-gen-cdk").onclick = async () => {
     return;
   }
   const codes = (res.data.codes || []).map((c) => c.code).filter(Boolean);
+  // Pinned mode reserves one code per address and silently skips any that don't
+  // exist / are already sold / are already reserved by another pinned code — tell
+  // the admin how many were dropped instead of only reporting the successes.
+  const pinnedSkipped = pinnedAddresses.length ? pinnedAddresses.length - codes.length : 0;
   await copyCreatedCredentials(codes, {
     successMessage: `已生成 ${codes.length} 个卡密并复制到剪贴板`,
     fallbackMessage: `已生成 ${codes.length} 个卡密，浏览器不支持自动复制，请从结果面板手动复制`,
     resultPayload: res.data,
   });
-  setCdkStatus(`已生成 ${codes.length} 个卡密`, "ok");
-  setTimeout(() => setCdkStatus(""), 5000);
+  if (pinnedSkipped > 0) {
+    setCdkStatus(`已生成 ${codes.length} 个专属卡密；${pinnedSkipped} 个地址被跳过（不存在 / 已售 / 已被其他专属码预留）`, "error");
+  } else {
+    setCdkStatus(`已生成 ${codes.length} 个卡密`, "ok");
+    setTimeout(() => setCdkStatus(""), 5000);
+  }
+  ["cdk-batch", "cdk-note", "cdk-pinned", "cdk-expires"].forEach((id) => { const node = el(id); if (node) node.value = ""; });
+  const countLabelReset = el("cdk-count").closest("label");
+  if (countLabelReset) countLabelReset.style.display = "";
   await refreshStats();
   await refreshStock();
   await refreshCdks(true);
@@ -6842,8 +7071,10 @@ el("cdk-status-filter").onchange = () => refreshCdks(true);
 if (el("cdk-tag-filter")) el("cdk-tag-filter").onchange = () => refreshCdks(true);
 el("btn-refresh-stock").onclick = () => { refreshStats(); refreshStock(); };
 el("replace-address").addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); el("btn-replace").click(); } });
+let replaceStatusTimer = null;
 el("btn-replace").onclick = async () => {
   const address = el("replace-address").value.trim();
+  clearTimeout(replaceStatusTimer);
   if (!address) { el("replace-status").textContent = "请输入邮箱地址"; return; }
   el("replace-status").textContent = "换货中...";
   const res = await api("/web/admin/mailboxes/replace", { method: "POST", body: JSON.stringify({ address }) });
@@ -6852,6 +7083,7 @@ el("btn-replace").onclick = async () => {
     el("replace-status").innerHTML = `已换货，新凭据：<code style="user-select:all;word-break:break-all">${escapeHtml(cred)}</code> <button type="button" id="replace-copy-btn" class="ghost" style="font-size:12px">复制凭据</button>`;
     el("replace-copy-btn").onclick = async () => { await copyText(cred); el("replace-copy-btn").textContent = "已复制"; };
     el("replace-address").value = "";
+    replaceStatusTimer = setTimeout(() => { el("replace-status").textContent = ""; }, 20000);
     refreshStats(); refreshStock(); if (typeof refreshCdks === "function") refreshCdks(true);
   } else {
     const map = { mailbox_not_found: "邮箱不存在", not_sold: "该邮箱未售出，无需换货", insufficient_stock: "同标签暂无可补发库存", missing_address: "请输入邮箱地址" };
@@ -7154,12 +7386,12 @@ function confirmAction(msg) {
             tag_id = self._parse_int((query.get("tag_id") or ["0"])[0], default=0, minimum=0, maximum=10_000_000)
             limit = self._parse_int((query.get("limit") or ["50"])[0], default=50, minimum=1, maximum=200)
             offset = self._parse_int((query.get("offset") or ["0"])[0], default=0, minimum=0, maximum=10_000_000)
-            items, total = self.app.store.list_cdks(
+            items, total, total_used = self.app.store.list_cdks(
                 keyword=keyword, status=status, tag_id=tag_id, limit=limit, offset=offset
             )
             self._send_json(
                 HTTPStatus.OK,
-                {"ok": True, "cdks": items, "total": total, "limit": limit, "offset": offset},
+                {"ok": True, "cdks": items, "total": total, "total_used": total_used, "limit": limit, "offset": offset},
             )
             return
         if parsed.path.startswith("/web/admin/cdks/") and parsed.path.endswith("/mailboxes"):
@@ -7198,10 +7430,21 @@ function confirmAction(msg) {
             keyword = str((query.get("keyword") or [""])[0] or "").strip()
             status = str((query.get("status") or [""])[0] or "").strip()
             tag_id = self._parse_int((query.get("tag_id") or ["0"])[0], default=0, minimum=0, maximum=10_000_000)
-            items, _total = self.app.store.list_cdks(
-                keyword=keyword, status=status, tag_id=tag_id, limit=200, offset=0
-            )
-            lines = [str(item.get("code") or "") for item in items if item.get("code")]
+            # list_cdks caps limit at 200; export must return ALL matching codes,
+            # so page through until a short page arrives — otherwise a batch of 500
+            # exports only the first 200 and silently drops the rest.
+            lines: list[str] = []
+            export_offset = 0
+            while True:
+                items, _total, _used = self.app.store.list_cdks(
+                    keyword=keyword, status=status, tag_id=tag_id, limit=200, offset=export_offset
+                )
+                if not items:
+                    break
+                lines.extend(str(item.get("code") or "") for item in items if item.get("code"))
+                if len(items) < 200:
+                    break
+                export_offset += 200
             content = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
             self._send_bytes(
                 HTTPStatus.OK,
@@ -7438,6 +7681,17 @@ function confirmAction(msg) {
             return
         parsed = urlparse(self.path)
         if parsed.path == "/web/auth/register":
+            # 节流：公开端点，每次都跑昂贵 PBKDF2 + 写库，限制单 IP 短时间内的注册数，
+            # 挡住脚本刷号/CPU-DoS（在解析/哈希前就拦掉）。
+            reg_limiter_key = f"register:{self._client_ip()}"
+            reg_retry_after = self.app.register_limiter.retry_after(reg_limiter_key)
+            if reg_retry_after > 0:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"ok": False, "error": "too_many_attempts", "retry_after": reg_retry_after},
+                )
+                return
+            self.app.register_limiter.record(reg_limiter_key)
             try:
                 payload = self._read_json_body()
             except Exception as exc:
@@ -7632,6 +7886,14 @@ function confirmAction(msg) {
             self._send_json(HTTPStatus.OK, {"ok": True, **result})
             return
         if parsed.path == "/web/query-mails":
+            query_limiter_key = f"query:{self._client_ip()}"
+            query_retry_after = self.app.query_limiter.retry_after(query_limiter_key)
+            if query_retry_after > 0:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"ok": False, "error": "too_many_attempts", "retry_after": query_retry_after},
+                )
+                return
             try:
                 payload = self._read_json_body()
             except Exception as exc:
@@ -7647,9 +7909,13 @@ function confirmAction(msg) {
                 access_key = str(key_raw or "").strip()
             verified, credential, reason = self.app.store.verify_mailbox_access(address, access_key)
             if not verified or not credential:
+                # 仅凭据错误（非缺参）计入暴力试 key 计数
+                if reason not in {"missing_address", "missing_access_key"}:
+                    self.app.query_limiter.record(query_limiter_key)
                 status = HTTPStatus.BAD_REQUEST if reason in {"missing_address", "missing_access_key"} else HTTPStatus.UNAUTHORIZED
                 self._send_json(status, {"ok": False, "error": reason})
                 return
+            self.app.query_limiter.reset(query_limiter_key)
             records = self.app.store.list_messages(credential.address, limit=PUBLIC_QUERY_PAGE_SIZE, offset=0)
             total = self.app.store.count_messages(credential.address)
             self._send_json(
@@ -7667,6 +7933,14 @@ function confirmAction(msg) {
             )
             return
         if parsed.path == "/web/query-mail-detail":
+            query_limiter_key = f"query:{self._client_ip()}"
+            query_retry_after = self.app.query_limiter.retry_after(query_limiter_key)
+            if query_retry_after > 0:
+                self._send_json(
+                    HTTPStatus.TOO_MANY_REQUESTS,
+                    {"ok": False, "error": "too_many_attempts", "retry_after": query_retry_after},
+                )
+                return
             try:
                 payload = self._read_json_body()
             except Exception as exc:
@@ -7680,9 +7954,12 @@ function confirmAction(msg) {
                 message_id = 0
             verified, credential, reason = self.app.store.verify_mailbox_access(address, access_key)
             if not verified or not credential:
+                if reason not in {"missing_address", "missing_access_key"}:
+                    self.app.query_limiter.record(query_limiter_key)
                 status = HTTPStatus.BAD_REQUEST if reason in {"missing_address", "missing_access_key"} else HTTPStatus.UNAUTHORIZED
                 self._send_json(status, {"ok": False, "error": reason})
                 return
+            self.app.query_limiter.reset(query_limiter_key)
             record = self.app.store.get_message_for_address(credential.address, message_id)
             if not record:
                 self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "mail_not_found"})
